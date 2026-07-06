@@ -1,0 +1,30 @@
+# Never commit slides, tiles, embeddings, or trained models — large and often
+# sensitive. Keep the data/ directory structure, ignore its contents.
+data/*
+!data/slides/
+!data/cache/
+!data/annotations/
+!data/models/
+data/slides/*
+!data/slides/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+data/annotations/*
+!data/annotations/.gitkeep
+data/models/*
+!data/models/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Windows "downloaded from the internet" metadata streams
+*:Zone.Identifier
+
+# OS / editor cruft
+.DS_Store
+.idea/
+.vscode/

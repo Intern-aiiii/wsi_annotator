@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SlideProbe</title>
+
+  <!--
+    Phase 1: the browser loads the OpenSeadragon deep-zoom viewer and points it
+    at a DeepZoom tile source served by the Python backend. No annotation or ML
+    yet — this just proves the frontend <-> backend loop works.
+
+    OpenSeadragon is loaded from a CDN for simplicity. Because this is a local
+    tool, you may prefer to vendor it into frontend/vendor/ later so the app
+    works with no internet connection.
+  -->
+  <script src="https://cdn.jsdelivr.net/npm/openseadragon@4.1.0/build/openseadragon/openseadragon.min.js"></script>
+
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    #topbar {
+      position: fixed; top: 0; left: 0; right: 0; height: 44px;
+      display: flex; align-items: center; gap: 12px; padding: 0 14px;
+      background: #1f2430; color: #eaeaea; z-index: 10;
+    }
+    #topbar strong { font-weight: 600; }
+    #slide-picker { padding: 4px 6px; }
+    #status { font-size: 13px; color: #9aa4b2; }
+    #viewer {
+      position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
+      background: #0e1116;
+    }
+  </style>
+</head>
+<body>
+  <div id="topbar">
+    <strong>SlideProbe</strong>
+    <label>Slide:
+      <select id="slide-picker"></select>
+    </label>
+    <span id="status">loading…</span>
+  </div>
+
+  <div id="viewer"></div>
+
+  <script src="js/api.js"></script>
+  <script src="js/viewer.js"></script>
+  <!-- annotate.js is a stub for Phase 2; loaded but does nothing yet. -->
+  <script src="js/annotate.js"></script>
+</body>
+</html>

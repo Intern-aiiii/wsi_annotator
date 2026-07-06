@@ -1,0 +1,23 @@
+# SlideProbe Python dependencies.
+# Versions are left open for now; pin them once the environment is settled.
+# Note: OpenSlide also needs the system library (apt install openslide-tools).
+
+# --- Web server ---
+fastapi
+uvicorn[standard]
+
+# --- Slide I/O ---
+openslide-python
+
+# --- Foundation model (Virchow 2, frozen) ---
+torch>=2.0
+timm>=0.9.11
+huggingface_hub
+
+# --- Classifier head + array handling ---
+scikit-learn
+numpy
+joblib
+
+# --- Image handling ---
+pillow

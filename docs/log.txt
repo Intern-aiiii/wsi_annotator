@@ -1,0 +1,60 @@
+SlideProbe change log
+=====================
+
+2026-07-06
+- Added a "Change log" section to CLAUDE.md instructing that a running log be kept
+  in docs/log.txt and updated after each fulfilled user request.
+- Created this docs/log.txt file to start that history.
+- Scaffolded the project directory skeleton from the proposed layout in CLAUDE.md:
+    * backend/  — app.py, slides.py, patches.py, embeddings.py, classifier.py,
+      inference.py, models.py (+ __init__.py). All are commented stubs describing
+      each module's role and the phase it belongs to; no implementation yet.
+    * frontend/ — index.html and js/ (viewer.js, annotate.js, api.js), stubbed.
+    * data/     — slides/, cache/, annotations/, models/ with .gitkeep so the
+      empty dirs exist while their contents stay gitignored.
+    * requirements.txt — planned dependencies (FastAPI, OpenSlide, torch/timm,
+      scikit-learn, etc.), versions mostly unpinned for now.
+    * .gitignore — ignores data contents, Python cruft, and Zone.Identifier files.
+- Implemented Roadmap Phase 1 ("One slide on screen"):
+    * backend/slides.py — OpenSlide + DeepZoomGenerator: list slides, resolve a
+      slide_id to a file (with a path-traversal guard), serve the .dzi descriptor
+      and individual JPEG tiles; opened generators are cached per slide.
+    * backend/app.py — FastAPI routes: GET /api/slides, GET /slides/{id}.dzi,
+      GET /slides/{id}_files/{level}/{col}_{row}.jpeg; static frontend mounted at
+      "/" (last, so API/tile routes win).
+    * frontend — index.html loads OpenSeadragon (CDN) + a slide picker; js/api.js
+      wraps the backend calls; js/viewer.js lists slides, fills the picker, and
+      opens the first slide's DZI in OpenSeadragon.
+    * Marked Phase 1 done in CLAUDE.md.
+  Verified: Python byte-compiles; slide listing, id resolution, traversal guard,
+  and tile-URL parsing pass a stubbed-openslide test. NOT run end-to-end here —
+  the env has no FastAPI/OpenSlide and no sample WSI (see README to run it).
+- Tested Phase 1 end-to-end with a real slide. Since the machine has no sudo,
+  installed OpenSlide via the `openslide-bin` wheel (bundles libopenslide 4.0.1,
+  no apt needed) into an isolated scratchpad venv, plus FastAPI/uvicorn/Pillow.
+  Downloaded the Aperio CMU-1-Small-Region.svs (~1.9 MB, 2220x2967, MPP 0.499)
+  into data/slides/ (gitignored). Results:
+    * /api/slides lists the slide; /slides/<id>.dzi returns valid DZI XML
+      (2220x2967, TileSize 254, Format jpeg).
+    * Tiles decode as real JPEGs (magic ffd8ff); stitched a level-9 overview and
+      visually confirmed H&E tissue renders correctly.
+    * `uvicorn backend.app:app` boots and serves all routes over a real socket.
+    * Error paths verified: 404 missing slide, 404 out-of-range tile, 400
+      malformed tile name.
+  Backend fully verified; the only unexercised piece is the OpenSeadragon render
+  in an actual browser (standard DZI consumer — its inputs are confirmed valid).
+  Kept the sample .svs in data/slides/ so the app can be run locally as-is.
+- Reverted (at user request) the two changes made while answering "how do I run
+  the app": removed the openslide-bin lines from requirements.txt and deleted the
+  project-local .venv/. Repo is back to its post-Phase-1 state (sample .svs kept).
+- Debugged "browser did not load". Root cause was NOT the code or WSL networking:
+  a leftover uvicorn process (started from .venv) was stuck in D-state I/O sleep,
+  still holding 127.0.0.1:8000 but never responding — because .venv had been
+  deleted out from under the running process. Killed the stale process; verified
+  on a clean server that GET / (200 html), /api/slides, /js/*, and tile serving
+  all work. Confirmed it was purely the wedged process.
+- Recreated the project .venv (at user's request) with the Phase-1 deps
+  (fastapi, uvicorn, pillow, openslide-python, openslide-bin — no sudo needed)
+  and verified the app boots and serves all routes. Left port 8000 free.
+  Guidance to user: Ctrl+C the server before rebuilding .venv; check for stale
+  listeners with `ss -ltnp | grep :8000` if the browser hangs again.
