@@ -16,6 +16,20 @@
   -->
   <script src="https://cdn.jsdelivr.net/npm/openseadragon@4.1.0/build/openseadragon/openseadragon.min.js"></script>
 
+  <!--
+    Phase 2: Annotorious turns the OpenSeadragon viewer into an annotation
+    surface (draw rects/polygons; each carries a class label as a W3C tag).
+    Versions are pinned so the local tool keeps working even if newer, possibly
+    breaking releases ship. The toolbar plugin adds rect/polygon draw buttons
+    plus a draw-vs-pan mode toggle so navigation and drawing don't fight.
+  -->
+  <link
+    rel="stylesheet"
+    href="https://cdn.jsdelivr.net/npm/@recogito/annotorious-openseadragon@2.7.19/dist/annotorious.min.css"
+  />
+  <script src="https://cdn.jsdelivr.net/npm/@recogito/annotorious-openseadragon@2.7.19/dist/openseadragon-annotorious.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@recogito/annotorious-toolbar@1.2.1/dist/annotorious-toolbar.min.js"></script>
+
   <style>
     html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
     #topbar {
@@ -26,6 +40,40 @@
     #topbar strong { font-weight: 600; }
     #slide-picker { padding: 4px 6px; }
     #status { font-size: 13px; color: #9aa4b2; }
+    /* The Annotorious toolbar plugin renders its draw-tool buttons in here. */
+    #anno-toolbar { display: flex; gap: 4px; }
+    #anno-status { font-size: 13px; color: #9aa4b2; margin-left: auto; }
+    #classes-btn {
+      margin-left: 8px; padding: 4px 8px; cursor: pointer;
+      background: #2b3444; color: #eaeaea; border: 1px solid #3a4150;
+      border-radius: 4px;
+    }
+
+    /* Floating panel for managing the list of annotation class labels. */
+    #classes-panel {
+      position: fixed; top: 48px; right: 14px; z-index: 20; width: 230px;
+      background: #262b36; color: #eaeaea; border: 1px solid #3a4150;
+      border-radius: 6px; padding: 10px; font-size: 13px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    }
+    #classes-panel[hidden] { display: none; }
+    .cp-title { font-weight: 600; margin-bottom: 8px; }
+    #classes-list {
+      display: flex; flex-direction: column; gap: 4px;
+      max-height: 260px; overflow: auto; margin-bottom: 8px;
+    }
+    .cp-row { display: flex; align-items: center; gap: 6px; }
+    .cp-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+    .cp-name { flex: 1; }
+    .cp-tag { color: #9aa4b2; font-size: 11px; }
+    .cp-remove {
+      background: none; border: none; color: #9aa4b2; cursor: pointer;
+      font-size: 15px; line-height: 1; padding: 0 2px;
+    }
+    .cp-remove:hover { color: #ff6b6b; }
+    #classes-add { display: flex; gap: 4px; }
+    #classes-input { flex: 1; padding: 3px 5px; }
+    #classes-add button { padding: 3px 8px; cursor: pointer; }
     #viewer {
       position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
       background: #0e1116;
@@ -39,6 +87,19 @@
       <select id="slide-picker"></select>
     </label>
     <span id="status">loading…</span>
+    <div id="anno-toolbar"></div>
+    <span id="anno-status"></span>
+    <button id="classes-btn" type="button">Classes</button>
+  </div>
+
+  <!-- Class-label manager (Phase 2). Populated by annotate.js. -->
+  <div id="classes-panel" hidden>
+    <div class="cp-title">Annotation classes</div>
+    <div id="classes-list"></div>
+    <form id="classes-add">
+      <input id="classes-input" type="text" placeholder="new class name…" autocomplete="off" />
+      <button type="submit">Add</button>
+    </form>
   </div>
 
   <div id="viewer"></div>

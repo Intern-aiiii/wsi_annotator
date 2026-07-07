@@ -165,8 +165,11 @@ half-built Phase N+2.
       sample `.svs` via OpenSlide; OpenSeadragon displays it in the browser. No ML yet. This
       proves the whole frontend↔backend loop. *(Code complete; run once a slide + OpenSlide
       are installed — see README.)*
-- [ ] **Phase 2 — Annotation.** Add Annotorious; user draws regions; save coordinates as JSON
-      to `data/annotations/`.
+- [x] **Phase 2 — Annotation.** Annotorious (v2) on the OpenSeadragon viewer; user draws
+      rects/polygons and tags each with a class label; the full W3C annotation collection is
+      saved per-slide to `data/annotations/<slide_id>.json` via `GET`/`PUT
+      /api/slides/{id}/annotations`. *(Backend + wiring verified; in-browser draw/label
+      interaction to be confirmed in a browser — see docs/log.txt.)*
 - [ ] **Phase 3 — Patch extraction.** For each annotation, use OpenSlide to cut 224×224 tiles
       at the target magnification; discard background/white tiles with a tissue mask.
 - [ ] **Phase 4 — Embeddings.** Run patches through Virchow 2; store vectors. **Cache

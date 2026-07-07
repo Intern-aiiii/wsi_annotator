@@ -13,4 +13,18 @@ Sketch of the core entities:
 This grows as phases 2, 5, and 7 need more structure.
 """
 
-# TODO: define Pydantic models as the annotation/training features come online.
+from __future__ import annotations
+
+from pydantic import BaseModel
+
+
+class AnnotationCollection(BaseModel):
+    """The full set of annotations for one slide (Phase 2).
+
+    We keep each annotation as a permissive ``dict`` rather than modeling every
+    W3C WebAnnotation field: the frontend (Annotorious) is the source of truth
+    for that shape, and storing it as-is keeps the region geometry and the class
+    label (a ``tagging`` body) intact for Phases 3 and 5 to read later.
+    """
+
+    annotations: list[dict] = []

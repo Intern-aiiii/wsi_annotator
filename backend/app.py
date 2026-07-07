@@ -23,7 +23,8 @@ from fastapi import FastAPI, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend import slides
+from backend import annotations, slides
+from backend.models import AnnotationCollection
 
 app = FastAPI(title="SlideProbe")
 
@@ -36,6 +37,27 @@ FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 def api_list_slides():
     """List the slides available under data/slides/."""
     return {"slides": slides.list_slides()}
+
+
+@app.get("/api/slides/{slide_id}/annotations")
+def api_get_annotations(slide_id: str):
+    """Return a slide's saved annotations (W3C JSON), or 404 if no such slide."""
+    if annotations.annotations_path(slide_id) is None:
+        return JSONResponse({"error": f"slide '{slide_id}' not found"}, status_code=404)
+    return {"annotations": annotations.load(slide_id)}
+
+
+@app.put("/api/slides/{slide_id}/annotations")
+def api_put_annotations(slide_id: str, body: AnnotationCollection):
+    """Overwrite a slide's annotations with the posted list.
+
+    The frontend sends the whole collection on every change, so this is a plain
+    replace. Returns how many annotations were saved.
+    """
+    if annotations.annotations_path(slide_id) is None:
+        return JSONResponse({"error": f"slide '{slide_id}' not found"}, status_code=404)
+    saved = annotations.save(slide_id, body.annotations)
+    return {"saved": saved}
 
 
 # --- DeepZoom (consumed by OpenSeadragon) ----------------------------------

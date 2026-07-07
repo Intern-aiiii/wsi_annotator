@@ -18,8 +18,11 @@ function ensureViewer() {
     id: "viewer",
     prefixUrl: "https://cdn.jsdelivr.net/npm/openseadragon@4.1.0/build/openseadragon/images/",
     showNavigator: true,
+    animationTime: 0.3
     // The backend serves plain .dzi tile sources; defaults are fine otherwise.
   });
+  // Expose the instance so annotate.js (Phase 2) can attach Annotorious to it.
+  window.osdViewer = viewer;
   return viewer;
 }
 
@@ -27,7 +30,14 @@ function openSlide(slideId) {
   setStatus(`opening ${slideId}…`);
   const osd = ensureViewer();
   osd.open(API.dziUrl(slideId));
-  osd.addOnceHandler("open", () => setStatus(`showing ${slideId}`));
+  osd.addOnceHandler("open", () => {
+    setStatus(`showing ${slideId}`);
+    // Tell annotate.js (Phase 2) which slide is now on screen so it can load
+    // that slide's annotations and route saves to the right file.
+    document.dispatchEvent(
+      new CustomEvent("slideprobe:slide-opened", { detail: { slideId } })
+    );
+  });
   osd.addOnceHandler("open-failed", () =>
     setStatus(`failed to open ${slideId} (is the slide readable?)`)
   );

@@ -19,4 +19,31 @@ const API = {
   dziUrl(slideId) {
     return `/slides/${encodeURIComponent(slideId)}.dzi`;
   },
+
+  // --- Annotations (Phase 2) ------------------------------------------------
+
+  // Return the saved annotations (W3C JSON array) for a slide.
+  async getAnnotations(slideId) {
+    const res = await fetch(
+      `/api/slides/${encodeURIComponent(slideId)}/annotations`
+    );
+    if (!res.ok) throw new Error(`getAnnotations failed: HTTP ${res.status}`);
+    const data = await res.json();
+    return data.annotations || [];
+  },
+
+  // Overwrite a slide's annotations with the given list. Sends the whole
+  // collection each time (the backend does a plain replace).
+  async saveAnnotations(slideId, annotations) {
+    const res = await fetch(
+      `/api/slides/${encodeURIComponent(slideId)}/annotations`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ annotations }),
+      }
+    );
+    if (!res.ok) throw new Error(`saveAnnotations failed: HTTP ${res.status}`);
+    return res.json();
+  },
 };

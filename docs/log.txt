@@ -58,3 +58,85 @@ SlideProbe change log
   and verified the app boots and serves all routes. Left port 8000 free.
   Guidance to user: Ctrl+C the server before rebuilding .venv; check for stale
   listeners with `ss -ltnp | grep :8000` if the browser hangs again.
+
+2026-07-07
+- Implemented Roadmap Phase 2 ("Annotation"): draw regions on a slide, label
+  each with a class, and persist per-slide. Per-annotation class labels are
+  included now (not deferred to Phase 7) so saved annotations already carry the
+  region+label shape Phases 3/5 need.
+    * backend/annotations.py (new) — per-slide JSON store at
+      data/annotations/<slide_id>.json. load()/save() plus annotations_path(),
+      which reuses slides._resolve_slide_path so only real slides are writable
+      (path-traversal guard). save() writes atomically (temp file + os.replace).
+    * backend/models.py — added permissive AnnotationCollection Pydantic model
+      (annotations: list[dict]); stores raw W3C JSON as-is.
+    * backend/app.py — GET/PUT /api/slides/{id}/annotations (404 for unknown
+      slide; PUT does a whole-collection replace, returns {"saved": N}).
+    * frontend — Annotorious v2 (@recogito/annotorious-openseadragon@2.7.19) +
+      toolbar plugin (@recogito/annotorious-toolbar@1.2.1) via jsDelivr CDN
+      (versions pinned). viewer.js now exposes window.osdViewer and fires a
+      "slideprobe:slide-opened" event on open; annotate.js attaches Annotorious,
+      adds a TAG widget for the class label, mounts the draw-tool/mode toolbar,
+      and saves the whole collection on create/update/delete. api.js gained
+      get/saveAnnotations. index.html loads the CDN assets and hosts the toolbar
+      + save-status UI in the topbar.
+    * Marked Phase 2 done in CLAUDE.md.
+  Verified: backend byte-compiles; against the sample CMU-1-Small-Region slide,
+  the annotations API round-trips (empty GET -> PUT one W3C annotation ->
+  {"saved":1} -> GET returns it -> file written to data/annotations/). 404s fire
+  for unknown slides on both GET and PUT; a URL-encoded traversal id (..%2F..)
+  never reaches the handler (fails route matching). Static frontend serves
+  index.html + all js/, and the three pinned CDN assets return 200. NOT exercised
+  here: the in-browser draw/label/render interaction (needs a real browser) —
+  see the plan's manual step. Reset the test annotation file back to empty.
+- Debugged "no Annotorious toolbar; UI looks like Phase 1". Server was serving
+  the correct new assets; cause was browser-side (stale cache / slide rendering
+  from OSD's earlier cache). Hardened annotate.js to surface init/plugin-load
+  failures in the top-bar status instead of failing silently, and made the
+  toolbar optional so drawing still works if only the toolbar plugin is missing.
+  A hard refresh resolved it for the user.
+- Expanded annotation class labels (user wanted more than gland/not-gland).
+  Chose "both": a built-in PRESET list of common H&E categories (gland,
+  epithelium, stroma, tumor, necrosis, lymphocytes, blood vessel, adipose,
+  background) PLUS user-managed custom classes.
+    * frontend/js/annotate.js — class list (presets + custom) drives the TAG
+      widget vocabulary; custom classes persist in localStorage; a "Classes"
+      panel adds/removes them; each class gets a stable palette color applied to
+      its annotations via an Annotorious formatter + an injected stylesheet;
+      typing a brand-new label remembers it as a custom class automatically.
+      Changing the class list rebuilds the Annotorious instance (destroy+
+      recreate, preserving displayed annotations) to refresh the vocabulary.
+    * frontend/index.html — added the Classes button + floating panel markup and
+      styling. Class labels are still stored as standard W3C tagging bodies, so
+      no backend change was needed.
+- Attempted extra drawing tools (circle, freehand, point) via the official
+  @recogito/annotorious-selector-pack@0.6.1, then REVERTED at user request.
+    Why reverted: the tools drew shapes but did not integrate with the editor —
+    the new shapes could not be tagged or deleted like rect/polygon. Diagnosed
+    with a headless-Chromium (Playwright) end-to-end test driving the actual
+    tools: the shape is created but the draw-complete -> open-editor path throws
+    ("n.reduce is not a function", "getAttribute is not a function", "reading
+    'element' of null"), so the editor never opens (hence no tag / no delete).
+    Bisected annotorious-openseadragon 2.6.0 through 2.7.19 against the pack:
+    circle actually worked (editor opened, no errors) at ALL versions, but
+    FREEHAND failed at every version and POINT is documented as OSD-incompatible
+    (removed from the pack for OSD). So the breakage is inherent to the pack's
+    OSD support, not a version mismatch we can pin around.
+    Reverted the index.html selector-pack script and the annotate.js
+    SelectorPack() call; toolbar is back to rect + polygon only. (Debugging-only
+    Playwright install was also removed from the venv.)
+    Salvage note for later: circle looked reliable in an ISOLATED harness, but
+    NOT in the real app.
+- Tried again to add circle-only (user request), then REVERTED again. In the
+  full app (toolbar + per-class formatter), drawing a circle failed the same way
+  as freehand: the editor did not open and the page threw "n.reduce is not a
+  function" / "reading 'element' of null", so it couldn't be tagged or deleted.
+  The isolated harness that had made circle look OK omitted the formatter/toolbar
+  and its headless mouse-drag simulation proved flaky (circle passed once, failed
+  on reruns), so that earlier "circle works" result was not trustworthy. Net:
+  none of the selector-pack tools (circle/freehand/point) integrate reliably with
+  the editor on this Annotorious OSD setup. Reverted the index.html script and the
+  annotate.js SelectorPack() call; toolbar is rect + polygon only. Removed the
+  debugging Playwright install again. If curved/round regions are needed later,
+  the realistic path is a maintained library (e.g. Annotorious v3) or a custom
+  tool — not this pack.
