@@ -43,11 +43,55 @@
     /* The Annotorious toolbar plugin renders its draw-tool buttons in here. */
     #anno-toolbar { display: flex; gap: 4px; }
     #anno-status { font-size: 13px; color: #9aa4b2; margin-left: auto; }
-    #classes-btn {
+    #classes-btn, #predict-btn {
       margin-left: 8px; padding: 4px 8px; cursor: pointer;
       background: #2b3444; color: #eaeaea; border: 1px solid #3a4150;
       border-radius: 4px;
     }
+    #predict-btn:disabled { opacity: 0.6; cursor: default; }
+    /* Auto-learning status chip (Phase 7). */
+    #learn-status { margin-left: 8px; font-size: 13px; color: #9aa4b2; white-space: nowrap; }
+    #learn-status.err { color: #ff8f8f; }
+
+    /* Prediction controls panel (Phase 6). */
+    #predict-panel {
+      position: fixed; top: 48px; right: 14px; z-index: 20; width: 230px;
+      background: #262b36; color: #eaeaea; border: 1px solid #3a4150;
+      border-radius: 6px; padding: 10px; font-size: 13px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    }
+    #predict-panel[hidden] { display: none; }
+    #predict-panel label { display: block; margin-bottom: 6px; }
+    #predict-panel select { width: 100%; }
+    #predict-actions { display: flex; gap: 6px; margin: 8px 0; }
+    #predict-actions button { padding: 3px 8px; cursor: pointer; }
+    #predict-status { color: #9aa4b2; }
+
+    /* Shared overlay control (opacity + clear) shown for any region overlay,
+       whether from a supervised prediction or an annotation-similarity scan. */
+    #overlay-ctrl {
+      position: fixed; bottom: 14px; right: 14px; z-index: 20; width: 200px;
+      background: #262b36; color: #eaeaea; border: 1px solid #3a4150;
+      border-radius: 6px; padding: 10px; font-size: 13px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    }
+    #overlay-ctrl[hidden] { display: none; }
+    .oc-header { display: flex; align-items: center; margin-bottom: 6px; }
+    .oc-title { font-weight: 600; flex: 1; }
+    .oc-close {
+      background: none; border: none; color: #9aa4b2; cursor: pointer;
+      font-size: 16px; line-height: 1;
+    }
+    #overlay-ctrl label { display: block; margin-bottom: 6px; }
+    #overlay-ctrl input[type=range] { width: 100%; }
+    #overlay-status { color: #9aa4b2; }
+
+    /* The region overlay sits above tiles; don't intercept mouse events. */
+    .shapes-overlay { pointer-events: none; overflow: visible; }
+
+    /* "Find similar" button injected into the (light-themed) Annotorious editor. */
+    .find-similar-widget { padding: 6px 8px; border-top: 1px solid #ddd; }
+    .find-similar-btn { width: 100%; padding: 4px 8px; cursor: pointer; }
 
     /* Floating panel for managing the list of annotation class labels. */
     #classes-panel {
@@ -74,6 +118,14 @@
     #classes-add { display: flex; gap: 4px; }
     #classes-input { flex: 1; padding: 3px 5px; }
     #classes-add button { padding: 3px 8px; cursor: pointer; }
+
+    /* Shared panel header classes (used by the Predict panel header). */
+    .pp-header { display: flex; align-items: center; margin-bottom: 8px; }
+    .pp-title { font-weight: 600; flex: 1; }
+    .pp-close {
+      background: none; border: none; color: #9aa4b2; cursor: pointer;
+      font-size: 16px; line-height: 1;
+    }
     #viewer {
       position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
       background: #0e1116;
@@ -89,7 +141,9 @@
     <span id="status">loading…</span>
     <div id="anno-toolbar"></div>
     <span id="anno-status"></span>
+    <button id="predict-btn" type="button">Predict view</button>
     <button id="classes-btn" type="button">Classes</button>
+    <span id="learn-status" title="background learning status"></span>
   </div>
 
   <!-- Class-label manager (Phase 2). Populated by annotate.js. -->
@@ -102,11 +156,41 @@
     </form>
   </div>
 
+  <!-- Prediction controls (Phase 6). Populated by predict.js. -->
+  <div id="predict-panel" hidden>
+    <div class="pp-header">
+      <span class="pp-title">Predict</span>
+      <button class="pp-close" id="predict-close" type="button" title="close">×</button>
+    </div>
+    <label>Class:
+      <select id="predict-class"></select>
+    </label>
+    <div id="predict-actions">
+      <button id="predict-run" type="button">Predict view</button>
+    </div>
+    <div id="predict-status"></div>
+  </div>
+
+  <!-- Shared overlay control: opacity + clear for the current region overlay —
+       predict regions or an annotation-similarity scan. Shown by predict.js when
+       an overlay is placed. -->
+  <div id="overlay-ctrl" hidden>
+    <div class="oc-header">
+      <span class="oc-title">Overlay</span>
+      <button class="oc-close" id="overlay-clear" type="button" title="clear overlay">×</button>
+    </div>
+    <label>Opacity:
+      <input type="range" id="predict-opacity" min="0" max="1" step="0.05" value="0.6" />
+    </label>
+    <div id="overlay-status"></div>
+  </div>
+
   <div id="viewer"></div>
 
   <script src="js/api.js"></script>
   <script src="js/viewer.js"></script>
-  <!-- annotate.js is a stub for Phase 2; loaded but does nothing yet. -->
   <script src="js/annotate.js"></script>
+  <script src="js/predict.js"></script>
+  <script src="js/learn.js"></script>
 </body>
 </html>

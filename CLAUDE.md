@@ -170,15 +170,38 @@ half-built Phase N+2.
       saved per-slide to `data/annotations/<slide_id>.json` via `GET`/`PUT
       /api/slides/{id}/annotations`. *(Backend + wiring verified; in-browser draw/label
       interaction to be confirmed in a browser — see docs/log.txt.)*
-- [ ] **Phase 3 — Patch extraction.** For each annotation, use OpenSlide to cut 224×224 tiles
-      at the target magnification; discard background/white tiles with a tissue mask.
-- [ ] **Phase 4 — Embeddings.** Run patches through Virchow 2; store vectors. **Cache
-      aggressively** — recomputation is the main performance bottleneck.
-- [ ] **Phase 5 — Train the head.** Logistic regression (scikit-learn) on embeddings + labels;
-      train/val split; report precision/recall. Trains in seconds because embeddings are
-      precomputed. (Details below.)
-- [ ] **Phase 6 — Predict + overlay.** Tile the whole slide, embed, classify, return a heatmap
-      overlay to OpenSeadragon.
+- [x] **Phase 3 — Patch extraction.** `backend/patches.py` cuts non-overlapping 224×224 tiles
+      from each annotation at `TARGET_MPP=0.5` (~20×) with OpenSlide, drops background via a
+      PIL saturation tissue mask, and writes a labelled patch manifest + preview montage to
+      `data/cache/patches/`. Exposed via `POST/GET /api/slides/{id}/patches` (+ `/preview.jpg`).
+      Backend + API only; verified end-to-end (see docs/log.txt).
+- [x] **Phase 4 — Embeddings.** `backend/embeddings.py` embeds each manifest patch behind a
+      swappable interface (`SLIDEPROBE_EMBEDDER` env: `dev` default | `virchow2`) and caches
+      vectors aggressively — an `(N, DIM)` `.npy` + row-aligned index JSON under
+      `data/cache/embeddings/`, keyed by `(slide_id, x, y, level, model_id)`. Default is a
+      lightweight numpy/PIL stand-in (`dev-colorstats-v1`, 62-dim) so the pipeline runs
+      without the gated model; **Virchow 2** (frozen ViT-H → 2560-dim, CLS ⊕ mean patch
+      tokens) is the opt-in production backend. Triggered by the "Compute embeddings" button;
+      `POST/GET /api/slides/{id}/embeddings`. Verified end-to-end on the dev backend (see
+      docs/log.txt). *To enable Virchow 2: `pip install torch timm huggingface_hub`, get HF
+      access to paige-ai/Virchow2, `huggingface-cli login`, run with
+      `SLIDEPROBE_EMBEDDER=virchow2`.*
+- [x] **Phase 5 — Train the head.** `backend/classifier.py` pools every slide's cached
+      embeddings for the active model and trains a `StandardScaler` + `LogisticRegression`
+      (`class_weight="balanced"`) head. Honest metrics via **region-grouped out-of-fold CV**
+      (patches carry a `group` = drawn-region id, so adjacent tiles never leak across the
+      split); reports per-class precision/recall/F1 + confusion matrix. Persists
+      `data/models/head__<model_id>.{joblib,json}` (metadata records the embedding
+      `model_id`/config). Triggered by the "Train classifier" button; `POST /api/train`,
+      `GET /api/model`. Verified end-to-end (see docs/log.txt).
+- [x] **Phase 6 — Predict + overlay.** `backend/inference.py` scores the **current viewport**
+      (chosen over a whole-slide sweep to stay responsive on gigapixel slides): tiles the
+      visible region, tissue-masks, embeds (in-memory session cache, separate from training),
+      runs `head.predict_proba`, and renders an RGBA heatmap PNG that the frontend drops on
+      OpenSeadragon as an overlay aligned to the scored grid. Class picker + opacity slider +
+      Clear; `POST /api/slides/{id}/predict`, `GET .../heatmap.png`. `MAX_TILES` cap →
+      "zoom in" when too far out. Triggered by the "Predict view" button. Verified end-to-end
+      (see docs/log.txt).
 - [ ] **Phase 7 — Close the loop + polish.** Let the user correct predictions, add
       annotations, and retrain (the active-learning cycle). Then: multiple classes, project/
       slide management, export.

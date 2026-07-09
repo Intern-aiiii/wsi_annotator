@@ -264,13 +264,48 @@ async function loadForSlide(slideId) {
   }
 }
 
+// --- "Find similar" editor widget -------------------------------------------
+
+// A custom Annotorious editor widget: a "Find similar" button rendered inside
+// the annotation popup (alongside the class TAG widget). Clicking it asks the
+// backend to highlight regions of the current view whose embedding resembles
+// THIS whole annotation — unsupervised, so it needs no trained model. We only
+// dispatch an event here; predict.js does the API call + overlay, keeping the
+// annotation module decoupled from the viewer/heatmap code.
+function findSimilarWidget(args) {
+  const container = document.createElement("div");
+  container.className = "find-similar-widget";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "find-similar-btn";
+  button.textContent = "🔍 Find similar";
+  button.addEventListener("click", () => {
+    // Prefer the plain W3C object (the backend parses its selector geometry);
+    // fall back to the wrapper if `.underlying` isn't present.
+    const annotation = (args.annotation && args.annotation.underlying) || args.annotation;
+    document.dispatchEvent(
+      new CustomEvent("slideprobe:find-similar", { detail: { annotation } })
+    );
+  });
+  container.appendChild(button);
+  return container;
+}
+
 // --- Annotorious lifecycle --------------------------------------------------
 
 // Build the Annotorious instance, its toolbar, and its event wiring.
 function buildAnnotorious() {
   anno = OpenSeadragon.Annotorious(window.osdViewer, {
-    // The TAG widget is the class label; its vocabulary is our class list.
-    widgets: [{ widget: "TAG", vocabulary: allClasses() }],
+    // Editor widgets: the TAG widget is the class label (vocabulary = our class
+    // list); the custom "Find similar" button drives the similarity heatmap.
+    // `force: "plainjs"` is REQUIRED: recogito-client-core's getWidget otherwise
+    // auto-detects widget type with a brittle regex over the function source and
+    // misclassifies our plain-DOM widget (it calls document.createElement) as a
+    // React component, so its returned node is discarded and nothing renders.
+    widgets: [
+      { widget: "TAG", vocabulary: allClasses() },
+      { widget: findSimilarWidget, force: "plainjs" },
+    ],
     // Color each annotation by its class label.
     formatter: annotationFormatter,
   });

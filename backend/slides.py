@@ -42,6 +42,11 @@ _SLIDE_EXTENSIONS = {".svs", ".ndpi", ".mrxs", ".tif", ".tiff", ".scn", ".svslid
 # Cache of opened DeepZoom generators, keyed by slide_id.
 _generators: dict[str, DeepZoomGenerator] = {}
 
+# Cache of opened OpenSlide objects, keyed by slide_id. Separate from the
+# generators above: Phase 3+ reads raw pixel regions (read_region) directly,
+# which is a different access pattern than DeepZoom tile serving.
+_slides: dict[str, OpenSlide] = {}
+
 
 def list_slides() -> list[dict]:
     """Return the slides available in data/slides/ as [{id, name}, ...].
@@ -72,6 +77,23 @@ def _resolve_slide_path(slide_id: str) -> Path | None:
             if path.resolve().parent == SLIDES_DIR.resolve():
                 return path
     return None
+
+
+def get_slide(slide_id: str) -> OpenSlide | None:
+    """Return (opening and caching if needed) the OpenSlide for a slide_id.
+
+    Public because Phase 3 patch extraction reads pixel regions straight from
+    the slide. Path resolution goes through `_resolve_slide_path`, so the same
+    traversal guard used everywhere else applies here too.
+    """
+    if slide_id in _slides:
+        return _slides[slide_id]
+    path = _resolve_slide_path(slide_id)
+    if path is None:
+        return None
+    slide = OpenSlide(str(path))
+    _slides[slide_id] = slide
+    return slide
 
 
 def _get_generator(slide_id: str) -> DeepZoomGenerator | None:

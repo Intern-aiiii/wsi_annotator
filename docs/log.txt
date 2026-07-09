@@ -140,3 +140,293 @@ SlideProbe change log
   debugging Playwright install again. If curved/round regions are needed later,
   the realistic path is a maintained library (e.g. Annotorious v3) or a custom
   tool — not this pack.
+- Implemented Roadmap Phase 3 ("Patch extraction"). Backend + API only (per
+  chosen scope); output is a per-slide manifest JSON + a preview montage. No new
+  dependencies — PIL + OpenSlide + stdlib only (tissue mask via PIL saturation,
+  point-in-polygon in pure Python).
+    * backend/slides.py — added get_slide(), a cached OpenSlide accessor (reuses
+      the _resolve_slide_path traversal guard) so patch reads don't duplicate
+      path logic.
+    * backend/patches.py — replaced the stub. Parses rect (FragmentSelector
+      xywh) and polygon (SvgSelector points) annotations + their tagging label,
+      grids each region into non-overlapping 224x224 patches at TARGET_MPP=0.5
+      (~20x, stored in the manifest for Phase 4 consistency), drops background
+      via a saturation tissue mask, and writes data/cache/patches/<id>.json
+      (atomic) plus <id>_preview.jpg (montage of up to 64 kept patches).
+      Coordinate correctness: offsets annotation coords by the slide's
+      (bounds-x, bounds-y) before read_region (0,0 for the sample) and reads at
+      the OpenSlide level best matching the target downsample.
+    * backend/app.py — POST /api/slides/{id}/patches (extract), GET
+      /api/slides/{id}/patches (manifest), GET .../patches/preview.jpg (montage);
+      404 for unknown slide / not-yet-extracted.
+  Verified end-to-end against CMU-1-Small-Region with a headless-free curl round
+  trip: a tissue rect (label gland), a background rect (label background) in a
+  white corner, and a tissue polygon (gland). Result: 22 candidates -> 13 kept,
+  9 dropped_background (the whole background rect), 0 skipped; per_class
+  {gland:13} (background produced no tissue patches, correctly absent). Manifest
+  written with slide_mpp 0.499 / target_mpp 0.5 / level 0; GET manifest + 404
+  paths OK; preview.jpg is a valid JPEG (768x192) that visually shows H&E tissue
+  (mean saturation ~79, not white). The polygon path exercised point-in-polygon
+  (kept 4 of its grid cells). Reset the sample's annotations + cleared the test
+  cache afterward so the app starts clean.
+- Added more sample slides (user request) from the OpenSlide testdata repo, for
+  variety in size/magnification: JP2K-33003-1.svs (61 MB, 15374x17497, 3 levels,
+  40x/0.25 mpp), CMU-1.svs (170 MB, 46000x32914, 3 levels, 20x), CMU-3.svs
+  (243 MB, 66000x45402, 4 levels, 20x). All verified to open with OpenSlide.
+  These are gitignored (data/slides/). The 40x JP2K slide and the multi-level
+  pyramids usefully exercise the Phase 3 magnification/level path beyond the
+  single-level 20x region we started with.
+- Added a UI trigger for patch extraction (Phase 3 had been backend/API-only, so
+  it could only be run via curl). Now there's an "Extract patches" button in the
+  topbar.
+    * frontend/index.html — Extract button + a floating results panel
+      (#patches-panel) with summary, per-class counts, and the preview montage
+      <img>; plus styles.
+    * frontend/js/api.js — extractPatches(slideId) (POST) and
+      patchesPreviewUrl(slideId) (cache-busted montage URL).
+    * frontend/js/patches.js (new) — tracks the current slide via the
+      slideprobe:slide-opened event, runs extraction on click (disables the
+      button + shows "extracting…"), renders counts/per-class, loads the montage,
+      handles the empty/no-annotations and error cases, and a close button.
+  Verified in a headless browser end-to-end: with a seeded tissue rect, clicking
+  Extract showed "9 patches kept / gland: 9" and the montage image loaded
+  (naturalWidth 768); the empty-annotations path shows a helpful hint; no JS
+  errors. Also confirmed opening the app does NOT wipe saved annotations
+  (persisted 1 -> 1 across a page load), ruling out a Phase 2 regression. Reset
+  test state afterward.
+- Implemented Roadmap Phase 4 ("Embeddings"). Chosen approach: swappable
+  embeddings interface with a lightweight stand-in default so the pipeline runs
+  today without the gated model; Virchow 2 wired as an opt-in backend. Trigger:
+  a "Compute embeddings" UI button. New dependency installed: numpy (torch/timm/
+  huggingface_hub intentionally NOT installed — only needed for Virchow 2).
+    * backend/embeddings.py — replaced the stub. Backend chosen by env var
+      SLIDEPROBE_EMBEDDER ("dev" default | "virchow2"). Each backend exposes
+      MODEL_ID/DIM/embed(). DevEmbedder = deterministic numpy/PIL color+texture
+      descriptor (RGB hists + RGB/HSV mean&std + gradient energy, 62-dim,
+      model_id dev-colorstats-v1) — a labelled STAND-IN, not Virchow 2.
+      Virchow2Embedder = lazy timm hf-hub load (SwiGLUPacked/SiLU), CUDA fp16
+      when available, out[:,0] cat mean(out[:,5:]) -> 2560-dim
+      (virchow2-clsmean-2560); raises EmbedderError with install/login guidance
+      if deps/access missing. embed_slide() reads the Phase 3 manifest, reuses
+      cached rows keyed by (slide_id,x,y,level,model_id), embeds only misses, and
+      writes an (N,DIM) .npy + a row-aligned index JSON under
+      data/cache/embeddings/ (atomic). active_model_id() reports the model id
+      without triggering a heavy load.
+    * backend/patches.py — added public read_patch() wrapper (delegates to
+      _read_patch) so embeddings.py fetches patch pixels without a private call.
+    * backend/app.py — POST /api/slides/{id}/embeddings (404 no slide, 400 no
+      manifest, 503 EmbedderError, else summary) and GET .../embeddings (saved
+      index summary or 404).
+    * frontend — "Compute embeddings" button + #embed-summary in the patches
+      panel; api.js computeEmbeddings(); patches.js enables the button after an
+      extraction with kept>0 and renders model/dim/counts/timing (+ surfaces
+      backend errors like model-not-available).
+  Verified end-to-end with the dev backend (curl + headless browser): extract ->
+  embed shows "9 embedded, 0 from cache", re-run "9 from cache" (cache works),
+  matrix (9,62) float32 all-finite; GET summary OK; 400 on a slide with no
+  manifest, 404 on a bogus slide; selecting virchow2 without torch raises the
+  clean EmbedderError (maps to 503). No JS errors. Cleaned all test cache after.
+  To enable Virchow 2 later: `pip install torch timm huggingface_hub`, request
+  access to paige-ai/Virchow2 on HF, `huggingface-cli login`, then run the server
+  with SLIDEPROBE_EMBEDDER=virchow2 (first run downloads ~2.5 GB; 6 GB GPU ok with
+  the small fp16 batch). Its 2560-dim vectors cache separately (different
+  model_id), so nothing collides with the dev embeddings.
+- Implemented Roadmap Phase 5 ("Train the classifier head"). Logistic-regression
+  head on the cached embeddings; UI "Train classifier" button + metrics panel.
+  New deps installed: scikit-learn + joblib (pulls scipy).
+    * Anti-leakage grouping: backend/patches.py now tags each patch with a
+      `group` = "<slide>::<annotation id>" (the drawn region), and
+      backend/embeddings.py carries `group` into each index row (falls back to
+      slide id for older caches). Phase 5 splits by this group so adjacent tiles
+      from one region never straddle train/val.
+    * backend/classifier.py — replaced the stub. _gather_dataset() pools EVERY
+      slide's embedding cache for the active model_id (X, y, groups). train()
+      builds StandardScaler+LogisticRegression(class_weight="balanced"), computes
+      honest metrics via region-grouped out-of-fold CV (cross_val_predict with
+      StratifiedGroupKFold, GroupKFold fallback; skipped with a reason if <2
+      groups), then refits on ALL data and persists head__<model_id>.joblib +
+      a .json sidecar (embedding_model_id, dim, classes, counts, per-slide
+      counts, validation, classification report + confusion matrix, created_at).
+      head_metadata()/load_head() for the GET route + Phase 6.
+    * backend/app.py — POST /api/train (400 no_data / need_2_classes, else
+      summary) and GET /api/model (metadata or 404).
+    * frontend — top-bar "Train classifier" button + a left-side #train-panel
+      (per-class precision/recall/F1/support table, accuracy, confusion matrix,
+      dataset counts, validation mode); api.js trainClassifier()/getModel();
+      new js/train.js renders it.
+  Verified end-to-end (direct + HTTP + headless browser): seeded 6 regions
+  (3 gland/3 stroma) on CMU-1-Small-Region -> extract -> embed -> train gave
+  status ok, 22 samples / 6 groups, "grouped 5-fold CV", per-class precision/
+  recall + 2x2 confusion matrix, head + metadata persisted; the reloaded head
+  predicts labels; GET /api/model returns metrics; single-class -> 400
+  need_2_classes; no embeddings -> 400 no_data. Full UI flow (Extract -> Compute
+  embeddings -> Train classifier) renders the metrics panel with no JS errors.
+  Accuracy was ~0.55 — expected, since the dev color-descriptor can't really
+  separate gland from stroma; the point is the pipeline + honest grouped metrics
+  (real separability comes with Virchow 2). Cleaned test state after.
+  Minor follow-up noted: annotate.js's annotation load is all-or-nothing — a
+  single malformed annotation (only reachable by injecting hand-written JSON, not
+  via the UI) makes Annotorious throw and skip rendering all of them; harmless to
+  the ML pipeline (which reads the backend file directly) but could be made
+  resilient later.
+- Implemented Roadmap Phase 6 ("Predict + heatmap overlay"). Chosen scope:
+  current view only — score just the on-screen region so it stays responsive on
+  gigapixel slides (no whole-slide sweep). UI "Predict view" button + heatmap
+  overlay. No new dependencies.
+    * backend/inference.py — replaced the stub. predict(slide_id, region, class)
+      snaps the requested DZI-image region to the global tile grid, reads/tissue-
+      masks each cell (reusing patches.read_patch/_is_tissue/_slide_mpp/
+      _bounds_offset), embeds tissue tiles via the active embedder, runs
+      head.predict_proba, and renders an RGBA heatmap PNG (one px/tile, numpy
+      blue->yellow->red ramp, alpha scaled by confidence, background transparent)
+      to data/cache/heatmaps/<slide>__<model>.png. Tile embeddings live in a
+      process-lived in-memory cache keyed by (slide,model,col,row) — SEPARATE
+      from the Phase 5 training cache, so inference never pollutes training data;
+      switching the shown class re-scores from cache in ~10ms. MAX_TILES=4000 cap
+      returns too_many_tiles when zoomed too far out.
+    * backend/models.py — PredictRegion model ({x,y,w,h} + `class` alias).
+    * backend/app.py — POST /api/slides/{id}/predict (404 no slide / 400 no_model
+      / 400 too_many_tiles / 503 EmbedderError / else summary) and GET
+      /api/slides/{id}/heatmap.png.
+    * frontend — top-bar "Predict view" button + #predict-panel (class dropdown
+      from GET /api/model, opacity slider, Predict/Clear); api.js predictView()/
+      heatmapUrl(); new js/predict.js computes the visible image rect
+      (viewportToImageRectangle, clamped to content size), POSTs it, and drops the
+      heatmap PNG as an OpenSeadragon overlay aligned to the scored grid via
+      imageToViewportRectangle; class-change re-predicts (cache-fast), slider sets
+      overlay opacity, Clear removes it.
+  Verified end-to-end (direct + HTTP + headless browser): trained a gland/stroma
+  head, predicted a tissue region -> status ok, 4x5 grid, 16/20 tissue tiles,
+  heatmap PNG written and visually correct (blue->red ramp over tissue, background
+  transparent); GET heatmap.png 200; class alias in body works; switching class
+  reused the in-memory cache (~10ms); too_many_tiles fired on CMU-1 whole slide
+  (30282 > 4000 -> 400); no_model -> 400; bogus slide -> 404. Headless UI: zoom ->
+  Predict view -> overlay <img> appears over the tissue, class dropdown populated,
+  opacity slider + class-switch + Clear all work, no JS errors (screenshot
+  confirmed the heatmap aligns to tissue). Cleaned test state after. Accuracy is
+  weak because the dev color-descriptor can't separate gland/stroma — the point is
+  the predict+overlay pipeline; sharp maps come with Virchow 2.
+- Enabled the real Virchow 2 backend (user logged into HF + granted gated access).
+  Installed torch 2.12.1+cu130 (CUDA works on the RTX 3050 6GB), timm 1.0.27,
+  huggingface_hub 1.22 into the venv. `hf auth login` done by the user (token
+  cached at ~/.cache/huggingface/token). Smoke test passed: model loads fp16 on
+  cuda, embeds a real tile to a (1,2560) float32 vector, ~0.2s/tile, deterministic;
+  weights cached (2.4 GB) under ~/.cache/huggingface. Full app pipeline verified
+  through the running server with SLIDEPROBE_EMBEDDER=virchow2: extract -> embed
+  (model_id virchow2-clsmean-2560, dim 2560) -> train -> predict all work.
+  Note on quality: a construct-true check (tissue vs background, a task whose
+  labels are correct by construction) gave 4-fold CV accuracy 1.000, confirming
+  the embeddings + pipeline are highly discriminative; the earlier ~0.5 gland/
+  stroma number came from fabricated test labels (boxes placed at arbitrary
+  coords on a skin biopsy, not real histology), not any model/plumbing issue.
+  Cleaned the fabricated test annotations + caches so real annotations start
+  fresh. Left the server running on the Virchow 2 backend (host 0.0.0.0). To run
+  it going forward: `SLIDEPROBE_EMBEDDER=virchow2 uvicorn backend.app:app
+  --host 0.0.0.0 --port 8000` (first embed per server process loads the model
+  ~20-30s from cache, then ~0.2s/tile on the GPU).
+
+2026-07-08 — Automatic background learning + annotation-based similarity (Phase 7).
+  Replaced the manual "Extract patches"/"Train classifier"/"Compute embeddings"
+  buttons with an automatic pipeline, and reworked the unsupervised similarity map
+  to compare against a selected annotation instead of a single clicked tile.
+  * NEW backend/jobs.py: a single debounced (~1.5s) background worker thread. The
+    PUT-annotations route now calls jobs.schedule(slide_id) after saving; the worker
+    coalesces rapid edits and runs extract_patches -> embed_slide -> train (global).
+    Graceful states: need_2_classes/no_data -> "waiting", EmbedderError -> "error",
+    success -> "ready". Exposed via GET /api/learn/status.
+  * embeddings.py: added a coarse module-level lock (embed_images()) so the worker
+    and a live similarity request don't hit torch/GPU concurrently.
+  * Similarity is now annotation-based: models.SimilarityRegion carries the full W3C
+    `annotation` (not cx,cy); inference.similarity() builds the reference from the
+    MEAN embedding of the annotation's tissue tiles (_annotation_reference_vector,
+    reusing patches._parse_annotation/_grid_origins/_is_tissue/_point_in_polygon),
+    then scores the visible region by cosine similarity as before. New status
+    empty_annotation -> 400.
+  * Frontend: removed the Extract/Train top-bar buttons and the patch-montage +
+    training-metrics panels; deleted js/patches.js and js/train.js. Added a small
+    top-bar learn-status chip (js/learn.js polls /api/learn/status; announces
+    slideprobe:model-ready). A "🔍 Find similar" button is injected into the
+    Annotorious editor popup (custom widget in annotate.js) and dispatches
+    slideprobe:find-similar; predict.js handles it via API.similarityByAnnotation.
+    Opacity + Clear moved into a dedicated floating #overlay-ctrl shown for any
+    heatmap (predict or similarity).
+  Verified end-to-end on the dev embedder (HTTP): PUT 2-class annotations ->
+  status idle->ready ("14 patches · 2 classes"), head__dev-colorstats-v1 written;
+  similarity-by-annotation -> ok (ref_label echoed, heatmap.png 200); predict ->
+  ok; off-tissue annotation -> 400 empty_annotation; single class -> waiting
+  ("draw a second class"). Frontend element/JS id contract checked statically
+  (no headless browser in this env — the Annotorious 2.7.19 custom-widget render
+  should be eyeballed once in a real browser). Test annotations/caches/model
+  cleaned afterwards so real annotations start fresh.
+
+2026-07-08 — Fix "Find similar" widget (default-tag predict scrapped).
+  * Bug fix: the "Find similar" button never rendered in the Annotorious editor
+    popup. Root cause is in recogito-client-core 1.7.9 (bundled by
+    annotorious-openseadragon 2.7.19): getWidget auto-detects widget type with a
+    regex over the function source, and our plain-DOM widget (it calls
+    document.createElement) was misclassified as a React component, so its node was
+    discarded. Fix: register it as `{ widget: findSimilarWidget, force: "plainjs" }`
+    in frontend/js/annotate.js, forcing the plain-JS WrappedWidget path. (Needs a
+    quick in-browser eyeball to confirm.)
+  * A zero-annotation default-tag "Predict view" (Virchow 2 prototype bank) was
+    prototyped and then scrapped at the user's request. All of it was reverted:
+    removed backend/prototypes.py + backend/build_prototypes.py, and reverted
+    inference.predict() (back to no_model when there's no head), GET /api/model,
+    and frontend/js/predict.js to their prior behaviour.
+
+2026-07-08 — Predict view: region boundaries instead of a heatmap.
+  "Predict view" now outlines the regions the trained head calls the selected
+  class with >= 80% probability, rather than painting a blue->red heatmap. Outline
+  only, tile-grid (blocky) edges, fixed 80% threshold. "Find similar" (annotation
+  similarity) is unchanged and still uses the heatmap.
+  * backend/inference.py: added PREDICT_MIN_CONFIDENCE = 0.8; predict() now returns
+    boundary SEGMENTS ([[x1,y1,x2,y2],...] in region-local px, via new
+    _boundary_segments: an inside tile (score>=thr) emits each edge bordering a
+    non-inside neighbor) plus n_above + min_confidence, and no longer writes a
+    heatmap PNG. _write_heatmap/_stretch_scores/heatmap.png route stay for
+    similarity. No API signature changes (threshold is a server constant).
+  * frontend/js/predict.js: placeOverlay branches — predict builds an <svg> outline
+    overlay (viewBox = scored region, preserveAspectRatio none, one <path> of the
+    segments, stroke #00e5ff, vector-effect non-scaling-stroke so lines stay crisp
+    at any zoom, pointer-events none); similarity keeps the <img> heatmap. Overlay
+    ref generalized (overlayEl); opacity slider fades whichever overlay is up;
+    status reads e.g. "adipose: 7 tiles >= 80%".
+  * frontend/index.html: .boundary-overlay CSS; overlay-control title "Heatmap" ->
+    "Overlay". frontend/js/api.js: predictView doc note (returns boundaries).
+  Verified on the dev embedder against the existing adipose/gland head: POST predict
+  -> status ok, mode predict, min_confidence 0.8, boundaries a list of axis-aligned
+  in-bounds segments, n_above (7 adipose / 44 gland) <= n_tissue (51); predict
+  writes NO heatmap (deleted the PNG, re-ran, stayed absent); similarity still
+  returns a heatmap with no boundaries. Frontend SVG overlay needs an in-browser
+  eyeball. Note: the dev :8000 --reload server was not running at end of session
+  (restart it to view); test server + heatmap cleaned up.
+
+2026-07-08 — Tinted region overlays (predict + find-similar) & stale-class fix.
+  * Predict + Find similar now share ONE overlay: a faint tinted fill over the
+    qualifying tiles plus a crisp outline (the heatmap is gone).
+    - inference.py: _boundary_segments -> _region_shapes(score_by_cell, size0, thr)
+      returning {cells:[x,y,w,h rects], boundaries:[x1,y1,x2,y2 segs], n_above}.
+      predict() uses PREDICT_MIN_CONFIDENCE=0.8; similarity() now thresholds its
+      min-max-stretched cosine score at SIMILARITY_MIN=0.8 and returns the same
+      shape data (no more heatmap). Removed _write_heatmap/_colormap/_RAMP/
+      heatmap_path/HEATMAPS_DIR; removed GET /heatmap.png route (app.py) and
+      API.heatmapUrl (api.js).
+    - predict.js: buildShapesOverlay() draws two SVG paths — fill (cells, color
+      #00e5ff at fill-opacity 0.2) + outline (boundaries, non-scaling-stroke).
+      placeOverlay() is now the single renderer for both modes. index.html:
+      .heatmap-overlay/.boundary-overlay -> .shapes-overlay.
+  * Fixed stale Predict-dropdown classes (model didn't track current annotations):
+    - embeddings.clear_cache(slide_id, model_id): deletes a slide's cached
+      matrix+index; embed_slide now calls it on the empty-manifest path so a slide
+      with no annotations stops poisoning training with old labels.
+    - classifier.delete_head(model_id): train() deletes the persisted head on
+      no_data/need_2_classes, so GET /api/model 404s instead of serving stale
+      classes.
+    - learn.js dispatches slideprobe:model-ready on "waiting" too, so an open
+      predict panel clears its dropdown the moment the model is invalidated.
+  Verified on the dev embedder: predict -> cells==n_above(7), 20 boundary segs,
+  all in-bounds; similarity -> mode similarity, cells==n_above(32), 54 segs,
+  min_confidence 0.8; GET heatmap.png -> 404. Stale-class repro FIXED live: a
+  slide with an old adipose/gland head but empty annotations -> PUT [] -> worker
+  cleared the stale embedding index AND deleted the head -> GET /api/model 404.
+  Frontend fill+outline rendering still needs an in-browser eyeball.
