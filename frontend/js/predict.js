@@ -12,10 +12,63 @@
 // plus a crisp outline. A shared "overlay control" (opacity + clear) manages it.
 
 let predictSlideId = null;
-let overlayEl = null; // the <svg> (predict) or <img> (similarity) currently overlaid
+let overlayEl = null; // the <svg> region overlay currently placed on the viewer
+
+// The two INDEPENDENT conditions for predicting. Both must hold, and the messaging
+// has to say which one is missing — they need completely different fixes.
+//   (a) this slide's features are extracted   -> Predict view AND Find similar
+//   (b) a classifier head exists (>=2 classes) -> Predict view only
+// Find similar uses no classifier, so it never mentions (b).
+let pdFeaturesReady = false;
+let featStatus = null; // last slideprobe:features detail, for a precise message
+let hasModel = false;
 
 function pdEl(id) {
   return document.getElementById(id);
+}
+
+const fmtN = (n) => Number(n || 0).toLocaleString();
+
+// Why is predicting blocked? null when it isn't.
+function gateReason() {
+  if (pdFeaturesReady && hasModel) return null;
+
+  const s = featStatus;
+  let featMsg = null;
+  if (!pdFeaturesReady) {
+    if (!s || s.state === "unknown") featMsg = "Checking feature status…";
+    else if (s.state === "running")
+      featMsg = `Extracting features… ${s.pct}% — Predict unlocks when it finishes.`;
+    else if (s.state === "cancelling") featMsg = "Cancelling feature extraction…";
+    else if (s.state === "partial")
+      featMsg = `Feature extraction is incomplete (${fmtN(s.done)} / ${fmtN(s.total)} tiles). Resume it to enable Predict.`;
+    else if (s.state === "error")
+      featMsg = `Feature extraction failed: ${s.detail || "unknown error"}`;
+    else if (s.state === "complete" && !s.nTissue)
+      featMsg = "No tissue found on this slide.";
+    else featMsg = "Extract features for this slide first.";
+  }
+  const modelMsg = hasModel
+    ? null
+    : "No trained model yet — annotate two classes, then predict.";
+
+  if (featMsg && modelMsg) return `${featMsg} Also: ${modelMsg[0].toLowerCase()}${modelMsg.slice(1)}`;
+  return featMsg || modelMsg;
+}
+
+// The single place the two conditions are combined into the button's state.
+function updatePredictGate() {
+  const reason = gateReason();
+  const run = pdEl("predict-run");
+  if (run) run.disabled = !!reason;
+  // A disabled button doesn't fire hover events, so a title on it would never show.
+  // Put it on the wrapper, and put the real explanation in visible text.
+  const actions = pdEl("predict-actions");
+  if (actions) actions.title = reason || "";
+  const open = pdEl("predict-btn");
+  if (open) open.title = reason || "predict the visible region";
+  const panel = pdEl("predict-panel");
+  if (reason && panel && !panel.hidden) pdStatus(reason);
 }
 
 function pdStatus(msg) {
@@ -36,14 +89,27 @@ function removeOverlay() {
   overlayEl = null;
 }
 
-// Fill the class dropdown from the trained model, or explain if there's none.
+// Fill the class dropdown from the trained model. It no longer owns #predict-run's
+// disabled state — that depends on the feature gate too, so updatePredictGate() owns
+// it and this just reports whether condition (b) holds.
 async function refreshClasses() {
   const select = pdEl("predict-class");
+  if (!API.projectId()) {
+    hasModel = false;
+    select.innerHTML = "";
+    updatePredictGate();
+    return null;
+  }
+  // Capture the project, and drop the answer if it changed mid-flight — otherwise
+  // project A's classes can land in the dropdown while you're looking at project B.
+  const pid = API.projectId();
   try {
     const model = await API.getModel();
-    if (!model || !model.classes || !model.classes.length) {
+    if (API.projectId() !== pid) return null;
+    hasModel = !!(model && model.classes && model.classes.length);
+    if (!hasModel) {
       select.innerHTML = "";
-      pdEl("predict-run").disabled = true; // caller sets the status message
+      updatePredictGate();
       return null;
     }
     const prev = select.value;
@@ -55,9 +121,11 @@ async function refreshClasses() {
       select.appendChild(opt);
     }
     if (model.classes.includes(prev)) select.value = prev;
-    pdEl("predict-run").disabled = false;
+    updatePredictGate();
     return model;
   } catch (err) {
+    hasModel = false;
+    updatePredictGate();
     pdStatus(`could not load model: ${err.message}`);
     return null;
   }
@@ -79,6 +147,13 @@ function visibleImageRegion() {
 
 async function runPredict() {
   if (!predictSlideId) return;
+  // Belt and braces: even if a stale button somehow survives, don't fire a request
+  // the backend would refuse anyway.
+  const blocked = gateReason();
+  if (blocked) {
+    pdStatus(blocked);
+    return;
+  }
   const region = visibleImageRegion();
   if (!region || region.w < 1 || region.h < 1) {
     pdStatus("nothing visible to predict");
@@ -98,7 +173,10 @@ async function runPredict() {
   } catch (err) {
     pdStatus(err.message);
   } finally {
-    btn.disabled = false;
+    // Restore via the gate, not `disabled = false` — the gate may have shut while the
+    // request was in flight (slide change, model invalidated), and blindly re-enabling
+    // would hand back a button that no longer has the right to run.
+    updatePredictGate();
   }
 }
 
@@ -107,6 +185,13 @@ async function runPredict() {
 // Triggered by the "Find similar" button in an annotation's editor popup.
 async function runFindSimilar(annotation) {
   if (!predictSlideId || !annotation) return;
+  // Find similar needs the feature bank, but NOT a trained model — so it must never
+  // complain about the model, only about features.
+  if (!pdFeaturesReady) {
+    pdEl("overlay-ctrl").hidden = false;
+    ocStatus("Extract features for this slide first.");
+    return;
+  }
   const region = visibleImageRegion();
   if (!region || region.w < 1) return;
   ocStatus("finding similar regions…");
@@ -122,11 +207,20 @@ async function runFindSimilar(annotation) {
   }
 }
 
-// Fixed high-contrast color for region overlays (outline + tint). A later
-// per-class color would just replace this constant with a lookup.
-const REGION_COLOR = "#00e5ff";
+// The overlay is drawn in the CLASS's colour (Phase 7). It used to be a fixed cyan
+// because the frontend had no authoritative per-class colour; the project stores one
+// now. Tinting a predicted region in the same colour as the annotations of that class
+// is the point: you can see at a glance whether the model agrees with what you drew.
+const FALLBACK_REGION_COLOR = "#00e5ff"; // Find-similar on an UNLABELLED annotation
 const REGION_FILL_OPACITY = "0.2"; // the "slight tint" inside each region
 const SVG_NS = "http://www.w3.org/2000/svg";
+
+// predictView() returns the class as `class`; similarityByAnnotation() as `ref_label`.
+function regionColor(result) {
+  const label = result.class || result.ref_label;
+  if (!label || !window.SlideProject) return FALLBACK_REGION_COLOR;
+  return window.SlideProject.colorOf(label);
+}
 
 // Build the SVG overlay for a scored region: a faint fill over the qualifying
 // tiles (`cells`) plus a crisp outline (`boundaries`). Both predict and "Find
@@ -135,6 +229,7 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 // constant width on screen at any zoom.
 function buildShapesOverlay(result) {
   const r = result.region;
+  const color = regionColor(result);
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("viewBox", `0 0 ${r.w} ${r.h}`);
   svg.setAttribute("preserveAspectRatio", "none");
@@ -150,7 +245,7 @@ function buildShapesOverlay(result) {
   }
   const fill = document.createElementNS(SVG_NS, "path");
   fill.setAttribute("d", fillD);
-  fill.setAttribute("fill", REGION_COLOR);
+  fill.setAttribute("fill", color);
   fill.setAttribute("fill-opacity", REGION_FILL_OPACITY);
   fill.setAttribute("stroke", "none");
   svg.appendChild(fill);
@@ -163,11 +258,17 @@ function buildShapesOverlay(result) {
   const outline = document.createElementNS(SVG_NS, "path");
   outline.setAttribute("d", lineD);
   outline.setAttribute("fill", "none");
-  outline.setAttribute("stroke", REGION_COLOR);
+  outline.setAttribute("stroke", color);
   outline.setAttribute("stroke-width", "2");
   outline.setAttribute("vector-effect", "non-scaling-stroke");
   svg.appendChild(outline);
   return svg;
+}
+
+// Legend swatch in the overlay control, so the tint explains itself.
+function setOverlaySwatch(color) {
+  const sw = pdEl("overlay-swatch");
+  if (sw) sw.style.background = color || "transparent";
 }
 
 // Drop the region overlay over the exact rectangle the backend scored, and reveal
@@ -182,26 +283,33 @@ function placeOverlay(result) {
   removeOverlay();
   overlayEl = buildShapesOverlay(result);
   v.addOverlay({ element: overlayEl, location });
+  setOverlaySwatch(regionColor(result));
   pdEl("overlay-ctrl").hidden = false;
 }
 
 function clearOverlay() {
   removeOverlay();
   pdEl("overlay-ctrl").hidden = true;
+  setOverlaySwatch(null);
   ocStatus("");
 }
 
 window.addEventListener("DOMContentLoaded", () => {
   const openBtn = pdEl("predict-btn");
   if (openBtn) {
+    // The top-bar button only OPENS the panel — it stays enabled even when the gate
+    // is shut, because the panel is the only place we can explain *why* it's shut
+    // (a disabled button can't show a tooltip). What's gated is the prediction
+    // itself: no auto-run below, and #predict-run is disabled.
     openBtn.addEventListener("click", async () => {
-      pdEl("predict-panel").hidden = false;
-      const model = await refreshClasses();
-      if (model) {
-        runPredict(); // predict immediately with the default class
-      } else {
-        pdStatus("No trained model yet — annotate two classes, then predict.");
+      window.SlidePanels.open("predict-panel");
+      await refreshClasses();
+      const blocked = gateReason();
+      if (blocked) {
+        pdStatus(blocked);
+        return;
       }
+      runPredict(); // predict immediately with the default class
     });
   }
   const runBtn = pdEl("predict-run");
@@ -211,7 +319,7 @@ window.addEventListener("DOMContentLoaded", () => {
   if (clearBtn) clearBtn.addEventListener("click", clearOverlay);
 
   const close = pdEl("predict-close");
-  if (close) close.addEventListener("click", () => { pdEl("predict-panel").hidden = true; });
+  if (close) close.addEventListener("click", () => window.SlidePanels.close("predict-panel"));
 
   const cls = pdEl("predict-class");
   if (cls) cls.addEventListener("change", runPredict); // re-score (cached; fast)
@@ -230,14 +338,47 @@ document.addEventListener("slideprobe:find-similar", (event) => {
 });
 
 // When the background worker finishes training, refresh the class dropdown so a
-// newly-available (or changed) model shows up without reopening the panel.
+// newly-available (or changed) model shows up without reopening the panel. Runs even
+// when the panel is closed — the gate needs `hasModel` to stay current either way.
 document.addEventListener("slideprobe:model-ready", () => {
-  if (!pdEl("predict-panel").hidden) refreshClasses();
+  refreshClasses();
+});
+
+// Feature state changed (features.js owns it). Condition (a) of the gate.
+document.addEventListener("slideprobe:features", (event) => {
+  featStatus = event.detail;
+  const was = pdFeaturesReady;
+  pdFeaturesReady = event.detail.ready;
+  // A sweep can finish while the panel sits open. Re-check the model too (it may have
+  // trained in the meantime) and re-open the gate without the user reopening the
+  // panel — but do NOT auto-predict: never fire a job the user walked away from.
+  if (pdFeaturesReady !== was) {
+    refreshClasses();
+    return;
+  }
+  updatePredictGate();
 });
 
 document.addEventListener("slideprobe:slide-opened", (event) => {
-  predictSlideId = event.detail.slideId;
+  predictSlideId = event.detail.slideId; // null when the project has no slides
+  // Features are per-slide, so BOTH conditions reset on a slide change — and they
+  // reset synchronously, so the gate shuts on the same tick rather than after a
+  // round-trip during which Predict would be wrongly clickable.
+  pdFeaturesReady = false;
+  featStatus = null;
+  hasModel = false;
   clearOverlay();
-  const panel = pdEl("predict-panel");
-  if (panel) panel.hidden = true;
+  window.SlidePanels.close("predict-panel");
+  updatePredictGate();
+});
+
+// A different project is active: the HEAD changed (the feature bank did not — it's
+// shared). Reset synchronously; predict.js must never score with the old head.
+document.addEventListener("slideprobe:project-opened", () => {
+  hasModel = false;
+  clearOverlay();
+  window.SlidePanels.close("predict-panel");
+  const select = pdEl("predict-class");
+  if (select) select.innerHTML = "";
+  updatePredictGate();
 });

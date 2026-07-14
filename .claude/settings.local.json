@@ -18,7 +18,8 @@
       "Bash(curl -sS -m 4 -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://172.27.131.84:8000/)",
       "Bash(ps -o pid,ppid,stat,etime,cmd -p 2750)",
       "Read(//proc/2750/**)",
-      "Bash(kill -9 2750)"
+      "Bash(kill -9 2750)",
+      "WebSearch"
     ]
   }
 }

@@ -38,19 +38,57 @@
       background: #1f2430; color: #eaeaea; z-index: 10;
     }
     #topbar strong { font-weight: 600; }
-    #slide-picker { padding: 4px 6px; }
-    #status { font-size: 13px; color: #9aa4b2; }
+    /* The bar reads left-to-right as scope narrowing: SlideProbe › Project › Slide. */
+    #slide-picker, #project-picker {
+      padding: 4px 6px; flex: none; max-width: 170px;
+    }
+    /* min-width:0 + ellipsis: a long status must not shove the controls off the bar. */
+    #status {
+      font-size: 13px; color: #9aa4b2;
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
     /* The Annotorious toolbar plugin renders its draw-tool buttons in here. */
     #anno-toolbar { display: flex; gap: 4px; }
-    #anno-status { font-size: 13px; color: #9aa4b2; margin-left: auto; }
-    #classes-btn, #predict-btn {
+    /* margin-left:auto pushes everything after this to the right-hand cluster.
+       min-width:0 + ellipsis stops a long status from shoving that cluster off-screen. */
+    #anno-status {
+      font-size: 13px; color: #9aa4b2; margin-left: auto;
+      min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    /* NB: an id-list selector — a new top-bar button renders unstyled unless it's here. */
+    #classes-btn, #predict-btn, #features-btn, #features-cancel, #projects-btn, #freehand-btn {
       margin-left: 8px; padding: 4px 8px; cursor: pointer;
       background: #2b3444; color: #eaeaea; border: 1px solid #3a4150;
       border-radius: 4px;
+      white-space: nowrap; flex: none;  /* the bar is a flexbox: don't wrap or squash labels */
     }
-    #predict-btn:disabled { opacity: 0.6; cursor: default; }
-    /* Auto-learning status chip (Phase 7). */
-    #learn-status { margin-left: 8px; font-size: 13px; color: #9aa4b2; white-space: nowrap; }
+    #predict-btn:disabled, #features-btn:disabled, #features-cancel:disabled {
+      opacity: 0.6; cursor: default;
+    }
+
+    /* Whole-slide feature extraction: button + progress bar + cancel. */
+    #features-box { display: flex; align-items: center; gap: 6px; }
+    #features-btn { white-space: nowrap; }
+    #features-cancel { margin-left: 0; padding: 4px 7px; line-height: 1; }
+    #features-cancel[hidden], #features-bar[hidden] { display: none; }
+    #features-bar {
+      display: inline-block; width: 90px; height: 4px; border-radius: 2px;
+      background: #3a4150; overflow: hidden;
+    }
+    #features-bar-fill {
+      display: block; height: 100%; width: 0%; background: #6ea8fe;
+      transition: width .3s linear;
+    }
+    #features-status { font-size: 13px; color: #9aa4b2; white-space: nowrap; }
+    #features-status.err { color: #ff8f8f; }
+    #features-status.ok { color: #7bd88f; }
+
+    /* Auto-learning status chip (Phase 7). Capped + ellipsised so a long message
+       can't push the right-hand controls off the edge of the bar. */
+    #learn-status {
+      margin-left: 8px; font-size: 13px; color: #9aa4b2; white-space: nowrap;
+      max-width: 220px; overflow: hidden; text-overflow: ellipsis;
+    }
     #learn-status.err { color: #ff8f8f; }
 
     /* Prediction controls panel (Phase 6). */
@@ -89,9 +127,42 @@
     /* The region overlay sits above tiles; don't intercept mouse events. */
     .shapes-overlay { pointer-events: none; overflow: visible; }
 
+    /* --- Freehand (lasso) tool ---------------------------------------------
+       While armed, a transparent layer sits over the viewer and SWALLOWS every
+       pointer event, so neither OpenSeadragon (pan/zoom) nor Annotorious (select)
+       ever sees the stroke. That is what keeps the tool from fighting them for
+       events. `inset: 0` on a positioned parent means it tracks the viewer's size
+       with no resize JS. It is torn down the instant a stroke ends — otherwise it
+       would cover the annotation editor popup and swallow clicks on the tag box. */
+    #freehand-btn.active {
+      background: #6ea8fe; border-color: #6ea8fe; color: #10131a; font-weight: 600;
+    }
+    .freehand-capture {
+      position: absolute; inset: 0; z-index: 5;
+      cursor: crosshair;
+      touch-action: none;          /* or the browser pans/pinches instead of drawing */
+      background: transparent;
+    }
+    .freehand-preview { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+    .freehand-preview polyline {
+      fill: none; stroke: #6ea8fe; stroke-width: 2;
+      stroke-linejoin: round; stroke-linecap: round;
+    }
+
+    /* A self-crossing lasso must LOOK like what the backend will train on. Both
+       Annotorious's hit-test and backend/patches.py's _point_in_polygon are even-odd
+       ray casts, but SVG fills with `nonzero` by default — so without this a crossed
+       lobe renders solid while training silently punches a hole in it. */
+    .a9s-annotation .a9s-inner, .a9s-annotation polygon { fill-rule: evenodd; }
+
     /* "Find similar" button injected into the (light-themed) Annotorious editor. */
     .find-similar-widget { padding: 6px 8px; border-top: 1px solid #ddd; }
     .find-similar-btn { width: 100%; padding: 4px 8px; cursor: pointer; }
+    .find-similar-btn:disabled { opacity: 0.55; cursor: default; }
+    /* A disabled <button> fires no hover events, so its own title never shows —
+       the reason it's disabled has to be visible text (and the tooltip lives on
+       the enclosing .find-similar-widget). */
+    .find-similar-note { font-size: 11px; color: #777; margin-top: 4px; text-align: center; }
 
     /* Floating panel for managing the list of annotation class labels. */
     #classes-panel {
@@ -101,15 +172,19 @@
       box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
     }
     #classes-panel[hidden] { display: none; }
-    .cp-title { font-weight: 600; margin-bottom: 8px; }
     #classes-list {
       display: flex; flex-direction: column; gap: 4px;
       max-height: 260px; overflow: auto; margin-bottom: 8px;
     }
     .cp-row { display: flex; align-items: center; gap: 6px; }
-    .cp-swatch { width: 12px; height: 12px; border-radius: 3px; flex: none; }
+    /* The colour is stored per class on the server now, so the swatch is EDITABLE. */
+    input.cp-swatch {
+      width: 16px; height: 16px; padding: 0; border: none;
+      background: none; cursor: pointer; flex: none;
+    }
+    input.cp-swatch::-webkit-color-swatch { border: 1px solid #3a4150; border-radius: 3px; }
     .cp-name { flex: 1; }
-    .cp-tag { color: #9aa4b2; font-size: 11px; }
+    .cp-empty, .prj-empty { color: #9aa4b2; }
     .cp-remove {
       background: none; border: none; color: #9aa4b2; cursor: pointer;
       font-size: 15px; line-height: 1; padding: 0 2px;
@@ -119,13 +194,52 @@
     #classes-input { flex: 1; padding: 3px 5px; }
     #classes-add button { padding: 3px 8px; cursor: pointer; }
 
-    /* Shared panel header classes (used by the Predict panel header). */
+    /* Project workspace manager. Shares the top-right slot with #classes-panel and
+       #predict-panel — panels.js keeps only one of the three open at a time, so they
+       can't draw on top of each other. */
+    #projects-panel {
+      position: fixed; top: 48px; right: 14px; z-index: 20; width: 260px;
+      background: #262b36; color: #eaeaea; border: 1px solid #3a4150;
+      border-radius: 6px; padding: 10px; font-size: 13px;
+      box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+      max-height: calc(100vh - 70px); overflow: auto;
+    }
+    #projects-panel[hidden] { display: none; }
+    .pp-rule { border: none; border-top: 1px solid #3a4150; margin: 10px 0; }
+    .pp-subtitle { font-weight: 600; margin-bottom: 6px; }
+    #projects-list, #projects-slides {
+      display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px;
+    }
+    #projects-slides { max-height: 150px; overflow: auto; }
+    .prj-row { display: flex; align-items: center; gap: 6px; }
+    .prj-row.active .prj-name { color: #7bd88f; font-weight: 600; }
+    .prj-name {
+      flex: 1; cursor: pointer;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .prj-btn {
+      background: none; border: none; color: #9aa4b2; cursor: pointer;
+      font-size: 14px; line-height: 1; padding: 0 2px;
+    }
+    .prj-btn:hover { color: #eaeaea; }
+    .prj-del:hover { color: #ff6b6b; }
+    .sl-row { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+    .sl-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #projects-add { display: flex; gap: 4px; }
+    #projects-input { flex: 1; padding: 3px 5px; }
+    #projects-add button { padding: 3px 8px; cursor: pointer; }
+    #projects-status { color: #9aa4b2; font-size: 12px; }
+    #projects-status.err { color: #ff8f8f; }
+
+    /* Shared panel header classes (used by the Predict, Classes and Projects panels). */
     .pp-header { display: flex; align-items: center; margin-bottom: 8px; }
     .pp-title { font-weight: 600; flex: 1; }
     .pp-close {
       background: none; border: none; color: #9aa4b2; cursor: pointer;
       font-size: 16px; line-height: 1;
     }
+    /* Legend for the region overlay: which class is this tint? */
+    .oc-swatch { width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; flex: none; }
     #viewer {
       position: fixed; top: 44px; left: 0; right: 0; bottom: 0;
       background: #0e1116;
@@ -135,20 +249,65 @@
 <body>
   <div id="topbar">
     <strong>SlideProbe</strong>
+    <!-- Project, then slide: the bar narrows scope left-to-right. A project owns its
+         annotations, classes and trained head, so two experiments can coexist over the
+         same slides. Driven by projects.js, which is also the app's boot driver. -->
+    <label>Project:
+      <select id="project-picker"></select>
+    </label>
     <label>Slide:
       <select id="slide-picker"></select>
     </label>
     <span id="status">loading…</span>
     <div id="anno-toolbar"></div>
     <span id="anno-status"></span>
+    <!-- Whole-slide feature extraction: the one slow, explicit step. Predict view
+         and Find similar stay locked until it completes. Driven by features.js. -->
+    <span id="features-box">
+      <button id="features-btn" type="button" disabled
+              title="Feature banks are SHARED across projects — extract once per slide">Extract features</button>
+      <button id="features-cancel" type="button" hidden title="stop the sweep (keeps whatever it already embedded)">×</button>
+      <span id="features-bar" hidden><span id="features-bar-fill"></span></span>
+      <span id="features-status"></span>
+    </span>
+    <!-- Freehand lives OUTSIDE #anno-toolbar on purpose: rebuildAnnotorious() clears
+         that container's innerHTML whenever the class list changes, which would take
+         this button with it. -->
+    <button id="freehand-btn" type="button" disabled
+            title="Draw a region freehand (lasso). Stays on until you switch it off.">✎ Freehand</button>
     <button id="predict-btn" type="button">Predict view</button>
     <button id="classes-btn" type="button">Classes</button>
+    <button id="projects-btn" type="button">Projects</button>
     <span id="learn-status" title="background learning status"></span>
   </div>
 
-  <!-- Class-label manager (Phase 2). Populated by annotate.js. -->
+  <!-- Project workspace manager (Phase 7). Populated by projects.js. -->
+  <div id="projects-panel" hidden>
+    <div class="pp-header">
+      <span class="pp-title">Projects</span>
+      <button class="pp-close" id="projects-close" type="button" title="close">×</button>
+    </div>
+    <div id="projects-list"></div>
+    <form id="projects-add">
+      <input id="projects-input" type="text" placeholder="new project name…" autocomplete="off" />
+      <button type="submit">Create</button>
+    </form>
+    <hr class="pp-rule" />
+    <div class="pp-subtitle">Slides in <span id="projects-active-name">…</span></div>
+    <!-- EVERY slide on disk, ticked if it's in this project. A slide that belongs to no
+         project is still listed here — this is the only way it can be adopted back into
+         one, which is what stops it from silently vanishing from the app. -->
+    <div id="projects-slides"></div>
+    <div id="projects-status"></div>
+  </div>
+
+  <!-- Class-label manager. The list, and each class's colour, belong to the PROJECT
+       (see projects.js); annotate.js renders them. -->
   <div id="classes-panel" hidden>
-    <div class="cp-title">Annotation classes</div>
+    <div class="pp-header">
+      <span class="pp-title">Annotation classes</span>
+      <button class="pp-close" id="classes-close" type="button" title="close">×</button>
+    </div>
     <div id="classes-list"></div>
     <form id="classes-add">
       <input id="classes-input" type="text" placeholder="new class name…" autocomplete="off" />
@@ -165,8 +324,10 @@
     <label>Class:
       <select id="predict-class"></select>
     </label>
+    <!-- Starts disabled: predicting needs BOTH extracted features and a trained
+         model. predict.js opens the gate only once it has verified both. -->
     <div id="predict-actions">
-      <button id="predict-run" type="button">Predict view</button>
+      <button id="predict-run" type="button" disabled>Predict view</button>
     </div>
     <div id="predict-status"></div>
   </div>
@@ -176,6 +337,7 @@
        an overlay is placed. -->
   <div id="overlay-ctrl" hidden>
     <div class="oc-header">
+      <span class="oc-swatch" id="overlay-swatch"></span>
       <span class="oc-title">Overlay</span>
       <button class="oc-close" id="overlay-clear" type="button" title="clear overlay">×</button>
     </div>
@@ -187,10 +349,19 @@
 
   <div id="viewer"></div>
 
+  <!-- Load order matters only for DEFINITIONS (these are plain globals, no modules).
+       BOOT order does not depend on it: projects.js is the single boot driver — it
+       fetches the project, dispatches slideprobe:project-opened to reset every module,
+       and only then calls SlideViewer.showProjectSlides(). See projects.js. -->
   <script src="js/api.js"></script>
+  <script src="js/panels.js"></script>
   <script src="js/viewer.js"></script>
   <script src="js/annotate.js"></script>
+  <!-- AFTER annotate.js: freehand reaches Annotorious only through window.SlideAnnotate. -->
+  <script src="js/freehand.js"></script>
   <script src="js/predict.js"></script>
   <script src="js/learn.js"></script>
+  <script src="js/features.js"></script>
+  <script src="js/projects.js"></script>
 </body>
 </html>

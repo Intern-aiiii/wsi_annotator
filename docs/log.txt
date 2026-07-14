@@ -430,3 +430,287 @@ SlideProbe change log
   slide with an old adipose/gland head but empty annotations -> PUT [] -> worker
   cleared the stale embedding index AND deleted the head -> GET /api/model 404.
   Frontend fill+outline rendering still needs an in-browser eyeball.
+
+2026-07-13 — Explicit whole-slide feature extraction; training + inference from a
+  feature bank. Embedding is off the interactive path entirely.
+  WHY: every annotation save was re-embedding. PUT /annotations -> jobs.schedule() ->
+  extract_patches -> embed_slide -> train, so drawing a box meant OpenSlide reads, GPU
+  inference, and a full retrain. Verifying that turned up something worse: a TRAIN/SERVE
+  SKEW. patches._grid_origins tiled each annotation from ITS OWN BBOX CORNER, while
+  inference._geometry tiled the viewport on a GLOBAL grid — same tile size and
+  magnification, different phase. The head was trained on one set of tile alignments and
+  applied to another. Both problems have one fix: a single global grid, embedded once.
+  * NEW backend/features.py — the feature bank. A vector for every tissue tile of a
+    slide on the global grid, plus the set of cells known to be background, per
+    (slide, model): data/cache/features/<slide>__<model>.{npy,json} (float16 — Virchow 2
+    already computes fp16 on CUDA, so it's free precision-wise and halves the file).
+    Cells stored as flat ints. `complete` is DERIVED (covered == cols*rows), never
+    trusted from the header, so a truncated file can't claim to be a finished sweep.
+    The sweep walks 16x16 blocks, reads+tissue-masks on a 4-worker pool (overlapping the
+    GPU), embeds in BATCH chunks, and is CANCELLABLE (threading.Event, checked between
+    blocks) and RESUMABLE (known cells are skipped; the bank is flushed on exit whether
+    it finished or was cancelled). Never calls embed_images while holding the bank lock
+    — the one deadlock path. Calls jobs.schedule() on finish, else the FIRST sweep would
+    leave the head untrained (annotations didn't change, so nothing else wakes the worker).
+  * patches.py — now the ONE grid + geometry + tissue module. grid_config() is the single
+    definition of the tile grid (verified by grep: nothing else calls _slide_mpp /
+    get_best_level_for_downsample / _bounds_offset). Added cells_in_region(),
+    cells_in_annotation() (pure geometry, reads NO pixels — this is what makes training
+    cheap), cell_origin/cell_index/read_cell. Deleted _grid_origins (the phase bug at its
+    root), extract_patches, the manifest, and the preview montage. The tissue mask now
+    sits behind one TISSUE_FN indirection with exactly ONE call site, so swapping in Otsu
+    later is a one-line change; tissue_mask_id() is recorded in each bank and validated on
+    load, so changing the mask correctly invalidates banks instead of mixing tiles judged
+    by two different rules.
+  * embeddings.py — stripped to JUST the model. Deleted embed_slide + the whole
+    per-slide training cache (EMBEDDINGS_DIR, _load_cache/_save_cache, clear_cache,
+    load_index). It now holds no cache and knows nothing about slides.
+  * classifier.py — _gather_dataset rebuilt: for each slide, ask each annotation which
+    grid cells it covers, look them up in the bank. No read_region, no embedder, no GPU.
+    Overlapping annotations that claim the same cell are deduped first-wins (the global
+    grid makes contradictory labels on one cell newly possible). Slides with no bank are
+    skipped whole rather than reporting tens of thousands of "missing" cells. train()
+    returns a `reason` (no_annotations / no_features / no_cells / no_tissue).
+  * jobs.py — retrain ONLY. The two lines extract_patches + embed_slide are gone; that
+    was the entire bug. Debounce, status dict, and the topbar chip are unchanged.
+  * inference.py — predict()/similarity() behave EXACTLY as before (same viewport scope,
+    MAX_TILES, 0.9 thresholds, cells+boundaries response, so predict.js's renderer needed
+    no change) but now SOURCE their vectors from the bank. _geometry and the in-memory
+    _tile_cache are gone — the resident bank is the cache, and unlike _tile_cache it
+    survives a restart and is shared with training. New gate: no_features -> HTTP 409,
+    checked BEFORE too_many_tiles (else a zoomed-out first-timer is told to "zoom in"
+    when the real problem is that nothing is extracted).
+  * app.py — POST/GET/DELETE /api/slides/{id}/features + POST .../features/cancel.
+    GET carries running_slide_id so a user who switches slides mid-sweep sees whose sweep
+    holds the worker. Deleted the dead /patches and /embeddings routes.
+  * Frontend — new js/features.js (IIFE): unconditional poll (1s running / 4s idle, the
+    learn.js pattern), which is what makes reload-mid-sweep, switch-away-and-back, and a
+    second tab all work with no extra code; a `seq` counter stops a stale poll for slide A
+    unlocking slide B. Topbar gains "Extract features" + a separate cancel (x) + progress
+    bar + count. GATING: Predict view needs features AND a model; Find similar needs only
+    features (it uses no classifier) — the messages distinguish them. #predict-run starts
+    disabled and is owned by updatePredictGate(); the topbar #predict-btn stays enabled
+    because it's the only way to SEE why the gate is shut (a disabled button shows no
+    tooltip) but it no longer auto-runs a prediction. Find similar (minted fresh per
+    editor popup) is disabled at creation from a module flag AND live-updated via
+    querySelectorAll, so an already-open popup un-greys the moment a sweep finishes.
+    Deleted the dead api.js helpers (extractPatches/computeEmbeddings/trainClassifier).
+  * Deleted stale caches: data/cache/{embeddings,patches,heatmaps} + the old __bank files.
+  BUG FOUND IN A REAL BROWSER: annotate.js and predict.js are classic scripts sharing ONE
+  global scope, and both declared `let featuresReady` — a duplicate top-level `let` is a
+  SyntaxError that killed predict.js outright (panel wouldn't open, no gate). Renamed to
+  annoFeaturesReady / pdFeaturesReady. Added a static check for colliding globals.
+  Verified end-to-end on the dev embedder (backend + headless Chromium):
+    - gate: predict/similarity -> 409 no_features on a cold slide, AND on a partial one.
+    - sweep CMU-1-Small-Region: 117 cells -> complete, n_tissue=51 — the exact count the
+      discarded 7e9b283 recorded for this slide, a free regression check on grid + mask.
+    - re-run embeds 0 (resumable). Cancel on CMU-1 (29,930 cells) lands in ~1.2s, leaves a
+      partial bank at 6,096, and resuming picks up at 7,584 rather than restarting.
+    - THE decisive test: monkeypatched embed_images/get_embedder/read_cell to RAISE, then
+      saved annotations — learn still reached "ready" in 1.56s (1.5s of which is the
+      debounce, so the training pass itself is ~60ms). No GPU, no pixels, on the save path.
+    - predict/similarity return in ~0ms and see exactly the bank's 51 tissue tiles.
+    - browser: cold slide greys Find similar with a visible "Extract features first"; the
+      predict panel opens but does not auto-run and names the failing condition; extract
+      shows live progress + cancel; an ALREADY-OPEN find-similar popup un-greys when the
+      sweep completes; cancel mid-sweep on CMU-1 -> "Resume extraction" and the gates stay
+      shut. No JS errors. (`e.getAttribute is not a function` on redraw is PRE-EXISTING —
+      it reproduces identically on the original frontend; an Annotorious 2.7.19 quirk.)
+  Test artifacts cleaned; the user's real annotations (CMU-1, JP2K) left untouched.
+  NOTE: the workflow is now open slide -> Extract features (once, slow, abortable) ->
+  annotate (retrains in <1s) -> predict. Features are REQUIRED before predicting.
+
+2026-07-13 — Otsu tissue mask (now the default; the fixed-saturation mask stays available).
+  Not the "one-line TISSUE_FN swap" I'd promised, and the reason is the interesting part:
+  Otsu ALWAYS finds a split. Run it per tile and a tile of blank glass gets its sensor noise
+  divided into "dark" and "light", reporting half the background as tissue. The histogram it
+  reads must actually contain both populations — so the threshold has to be derived once from
+  a view of the WHOLE slide. That makes the tissue gate per-slide, not a pure per-tile
+  function, so the interface changed.
+  * patches.py — `is_tissue(img)` / `TISSUE_FN` / `tissue_mask_id()` replaced by
+    `tissue_gate(slide) -> TissueGate`: a callable `gate(tile) -> bool` carrying its cutoff and
+    an `id`. Two gates, chosen by SLIDEPROBE_TISSUE ("otsu" default | "hsv"):
+      - hsv:  the old fixed cutoff (saturation >= 25). Predictable, stain-blind.
+      - otsu: cutoff LEARNED from the slide's own saturation histogram, read from a low-res
+        overview (`_overview`, longest side 2048, taken from the BOUNDED region — not
+        slide.get_thumbnail, which would include the scanner's dead margin and skew it).
+        `_otsu()` is classic between-class-variance maximization over the 256-bin histogram,
+        pure Python — no numpy/scikit-image. Clamped to [8, 80]: if a slide really is nearly
+        all tissue or nearly all background, Otsu is splitting noise and its threshold must
+        not be trusted.
+    Both gates then keep a tile whose saturated fraction >= MIN_TISSUE_FRACTION (0.30).
+  * features.py — caches the gate per (slide, mask name) since Otsu costs a low-res read;
+    the sweep builds it ONCE and applies it to every tile (still exactly one call site). Each
+    bank now records `tissue_mask` (e.g. "otsu-sat62-frac0.3") + `tissue_threshold`, validated
+    on load — LAST, after the cheap checks, so we don't pay for an overview read to reject a
+    bank the grid/model check already killed.
+  * classifier.py metadata records `tissue_mask` as the mask NAME ("otsu"/"hsv").
+  Measured on the real slides (thresholds Otsu derived): CMU-1-Small-Region 62, CMU-1 45,
+  CMU-3 42, JP2K 52 — all well above the fixed 25, overview read ~0.2s.
+  HONEST RESULT: on these well-stained H&E slides Otsu changes almost nothing. It is a strict
+  SUBSET of the hsv mask (otsu-only = 0 tiles), trimming only edge tiles: CMU-1 5,778 vs 5,798
+  tissue tiles (20 fewer of 29,930); CMU-1-Small-Region 48 vs 51. That is reassuring rather
+  than disappointing — tissue pixels sit far above saturation 62 and background near 0, so
+  MIN_TISSUE_FRACTION dominates and any cutoff in the 25–62 gap lands in the same place.
+  Otsu's value is ADAPTIVITY: a faintly-stained slide gets a low cutoff automatically, where
+  the fixed 25 would over-call background. Both masks were rendered over the slide overview
+  and eyeballed — both cover all four tissue sections and reject background, dust, and pen.
+  Verified: full e2e passes on Otsu (sweep -> complete, 48 tissue, train, predict, similarity,
+  no GPU on the save path). Swapping SLIDEPROBE_TISSUE to hsv makes the existing otsu bank
+  report state "none" (REJECTED, not silently reused) and swapping back accepts it again with
+  no re-sweep. Degenerate check: on a background-only histogram raw Otsu returns 3 (splitting
+  noise) -> clamped to 8, and a blank white tile is still correctly rejected.
+  NOTE: changing the mask invalidates existing banks BY DESIGN — a re-sweep is required, which
+  on Virchow 2 is minutes per slide. That is the right trade: mixing two masks' verdicts in
+  one bank would be a silent correctness bug.
+
+2026-07-14 — Phase 7 (part 1): PROJECTS.
+  A project is one experiment: it owns its annotations, its class list (each class with an
+  EXPLICIT stored colour), and its own trained head. Before this there was exactly ONE global
+  head and classifier._gather_dataset pooled the annotations of EVERY slide on disk, so two
+  experiments could not coexist — annotating "gland vs stroma" on one slide and "tumor vs
+  normal" on another produced a single contaminated four-class head with no way to separate,
+  compare, or throw one away.
+  Layout: data/projects/<id>/{project.json, annotations/<slide>.json, models/head__<embed>.*}.
+  New backend/projects.py (CRUD + the traversal guard + the migration); annotations.py,
+  classifier.py and jobs.py all take a project_id as a REQUIRED first arg (no default — a
+  `project_id=None -> "default"` fallback is exactly how you get a route that silently trains
+  the wrong project's head). New frontend/js/projects.js + panels.js.
+
+  THE LOAD-BEARING DECISION: the FEATURE BANK STAYS GLOBAL, not per-project. It is keyed by
+  (slide, embedding model, tissue mask) — nothing about an experiment enters it — so it is a
+  property of the FILE. Sweep CMU-1 once with Virchow 2 and every project containing it can
+  train and predict immediately. Scoping it per project would re-run the single most expensive
+  step in the pipeline once per project for nothing. This is why features.py's whole diff is
+  one word (jobs.schedule -> jobs.schedule_slide, which fans out to every project with that
+  slide) and patches/embeddings/slides are untouched. Verified: two projects over CMU-1 share
+  exactly ONE .npy, hold two different heads, and return different overlays for the same
+  viewport; deleting one leaves the bank byte-identical and the other still predicting.
+  Route rule: GLOBAL if it's about a file or a cache of a file (/api/slides, all /features*);
+  PROJECT-SCOPED if it's about the experiment (/api/projects/{pid}/... annotations, classes,
+  train, model, learn/status, predict, similarity). similarity does NOT need the project — it
+  gets one anyway, validated and unused, because it and predict are twin buttons and two URL
+  shapes for them would be a permanent trip hazard. Old routes DELETED, not aliased: a stale
+  frontend silently writing into the wrong project is the bug class this exists to prevent.
+  Active project lives in the CLIENT (localStorage + the path param). No server-side "current
+  project" global: that is a hidden mode two tabs would fight over.
+
+  MIGRATION is COPY + SENTINEL (data/projects/.legacy_imported), NOT "if data/projects/ is
+  missing". The naive trigger RESURRECTS DATA: delete every project, restart, and the
+  annotations you deleted come back. Copies (never moves) data/annotations/* + data/models/*
+  into a "default" project seeded with every slide on disk, so day-one behaviour is unchanged;
+  the legacy dirs survive as a frozen backup. Verified: delete-all + reboot brings nothing
+  back; `rm -rf data/projects` migrates again cleanly.
+
+  THREE BUGS FIXED on the way:
+  * Torn head read (pre-existing): classifier dumped joblib straight onto the live path, so a
+    predict landing during a debounced retrain could load a half-written file. Now tmp +
+    os.replace, like annotations.py always did.
+  * Delete-while-training resurrection: train()'s mkdir(parents=True) could re-create the
+    directory tree of a project being deleted. projects.LOCK is now held across a training
+    pass and across delete(), and classifier refuses to mkdir a project (-> "no_project").
+  * The "unlabeled" pseudo-class: patches.label_of() returns "unlabeled" for an untagged
+    region, and that string was becoming a REAL training class — in the predict dropdown, with
+    no colour, able to satisfy the need-2-classes check on its own. Now skipped and counted
+    ("4 tiles · 2 classes (2 unlabelled)").
+  Also fixed: class colour was derived from a class's INDEX, so deleting one repainted every
+  class after it. Colours are now stored per class, assigned first-unused. The predict overlay
+  takes the predicted class's real colour instead of a hardcoded cyan, so you can see at a
+  glance whether the model agrees with what you drew.
+
+  FRONTEND BOOT was a real race. viewer.js auto-opened slides[0] on DOMContentLoaded, and
+  script order could NOT fix it: projects.js's handler is async, so it yields at its first
+  await and viewer's runs on the same tick. viewer.js no longer boots itself — projects.js is
+  the single driver, dispatches slideprobe:project-opened (a SYNCHRONOUS reset; dispatchEvent
+  returns only after every listener has run), and only then calls SlideViewer.showProjectSlides
+  (). If the open slide is in the new project it is KEPT, not reopened, so switching project
+  preserves zoom/pan and the same tissue simply re-annotates itself with the other experiment's
+  regions. Panels (Projects/Classes/Predict) are now a radio group — they previously sat at
+  identical coordinates and neither closed the other.
+  BUG CAUGHT BY DRIVING THE REAL BROWSER: viewer.js and annotate.js are plain <script>s in one
+  global scope and I declared `let currentSlideId` in BOTH — a duplicate-declaration
+  SyntaxError that silently killed annotate.js entirely. The viewer still worked, so boot
+  "passed" while every class and every annotation was missing. Renamed to openSlideId.
+  Verified end to end in headless Chromium, 34/34 checks: class + annotation isolation across
+  projects, zoom preserved on switch, the shared bank (switch project -> features chip still
+  says "✓ 48 tissue tiles" with no re-sweep, and Predict is blocked on "no trained model", NOT
+  on "extract features" — that exact string is the proof), per-class overlay colour, the
+  recolour bug dead, zero-slide project, panel exclusivity, stale stored project id.
+  STILL OPEN in Phase 7: correcting predictions (the overlay is pointer-events:none and keeps
+  no per-cell identity) and export.
+
+2026-07-14 — FREEHAND (lasso) drawing. Attempt #3, and this one works.
+  THE PREVIOUS POST-MORTEM (above, 2 entries) WAS WRONG, and the wrong diagnosis is why two
+  attempts died. It blamed "the pack's OSD support" and concluded a version bisect couldn't
+  help. Reading the shipped bundles gives the real cause: the core's
+  format(shape, annotation, formatters) takes an ARRAY, and @recogito/annotorious-selector-
+  pack@0.6.1 vendored a copy of it but calls it with config.formatter -- the SINGULAR
+  function. annotate.js sets `formatter: annotationFormatter` (to colour regions by class),
+  so the pack did fn.reduce(...) -> "n.reduce is not a function", thrown inside
+  createEditableShape -> selectedShape never assigned -> selectAnnotation then read
+  `.element` of null. Every logged symptom, mechanically. And format() EARLY-RETURNS when no
+  formatter is configured -- which is exactly why the old isolated harness "proved" circle
+  worked: it omitted the one config key that triggers the bug. The harness didn't lie because
+  of flaky mouse-drags; it lied because it wasn't the real app. Bisecting the HOST library
+  could never have fixed a bug in the PACK.
+
+  THE FIX: don't add a shape type at all. A freehand stroke IS a polygon with many points,
+  and polygons are NATIVE to Annotorious -- handled by the core's own EditablePolygon, which
+  calls the correct plural API. So frontend/js/freehand.js captures the stroke itself (plain
+  pointer events on a transparent capture layer that swallows them, so neither OSD nor
+  Annotorious ever sees the drag and there is nothing to fight over), simplifies it
+  (Ramer-Douglas-Peucker, ~2 screen px), and hands the points to SlideAnnotate.addPolygon().
+  The selector pack is gone for good. The BACKEND NEEDED NO CHANGE for the feature: patches.py
+  already parses an SvgSelector polygon, and _bbox/_point_in_polygon are generic over any
+  vertex list. STICKY: the tool re-arms after each region, so you draw -> tag -> draw again.
+
+  FOUR CONSTRAINTS, EACH OF WHICH BREAKS IT SILENTLY (all are commented in the code):
+  * The SVG must be ONE LINE. Annotorious picks the editing tool with /^<svg.*<polygon/ --
+    no `s` flag, so `.` doesn't cross newlines. Pretty-print it and the shape still renders
+    but with NO vertex handles and no dragging, and nothing says why.
+  * fill-rule="evenodd" on the polygon (and in the CSS). SVG fills `nonzero` by default, but
+    BOTH hit-testers -- Annotorious's and patches._point_in_polygon -- are even-odd ray casts.
+    A lasso that crosses itself would RENDER solid but TRAIN with a hole punched in it: a
+    silent disagreement between what you see and what the model learns. Exactly the train/serve
+    skew class CLAUDE.md warns about.
+  * NEVER call saveCurrent() between addAnnotation() and selectAnnotation(). It looks required
+    (addAnnotation fires no createAnnotation) but (a) saveCurrent -> rememberTypedTags ->
+    ensureClasses -> "classes-changed" -> rebuildAnnotorious() DESTROYS the instance whose
+    editor you just opened, and (b) Annotorious keeps the shape in the DOM twice for ~1ms
+    during select, so a save landing there writes the region to disk TWICE. The save comes
+    free: the editor's OK fires updateAnnotation (not createAnnotation -- the shape is not a
+    "selection"), which annotate.js already wires to saveCurrent.
+  * Cap vertices (100). EditablePolygon draws ONE DRAG HANDLE PER VERTEX and rescales every
+    one on every OSD animation frame while selected -- a few thousand points locks the tab.
+    And _point_in_polygon is O(n) per candidate cell on EVERY debounced retrain, which would
+    quietly break the "retraining is cheap enough to run on every save" property. A real lasso
+    simplifies to 20-60 points.
+
+  A TRAP THAT COST AN HOUR, now pinned in both test scripts: the editor footer differs by
+  annotation kind. A freshly DRAWN shape has [Cancel][Ok]; an EXISTING one has
+  [DELETE][Cancel][Ok]. So `.r6o-btn:not(.outline)` picks OK on a drawn shape and DELETE on an
+  existing one. That made every programmatically-added region look like it was being deleted
+  by the library, and briefly looked like a catastrophic pre-existing data-loss bug. It was the
+  test clicking the trash can.
+
+  BACKEND HARDENING (a real, independent bug found on the way): patches._parse_annotation
+  returns None for any selector it can't read, cells_in_annotation then returns [], and the
+  region VANISHED from training with no counter and no error -- while similarity reported the
+  lie "covers no tissue" when the truth was "I can't read your shape". Now: patches.
+  parse_annotation() is public, classifier counts n_unparseable (surfaced in the learn chip as
+  "⚠ N unreadable") with a distinct `no_shapes` train reason, and similarity returns
+  bad_selector -> HTTP 400. This converts freehand's worst failure mode from invisible to loud.
+
+  VERIFIED in headless Chromium against the REAL app (real project + slide, formatter, toolbar,
+  TAG widget and the custom Find-similar widget all live -- the omission that made the old
+  harness lie). tests/spike_annotorious_api.py (19/19) pins the addAnnotation/selectAnnotation
+  contract this rests on, so a future Annotorious bump fails loudly; its key assertion is that
+  the shape gets one drag handle per vertex, which proves EditablePolygon ran to completion --
+  the exact step that threw in both prior attempts. tests/e2e_freehand.py (25/25, run 3x clean)
+  drives a real drag and asserts the whole pipeline: lasso -> polygon -> editor -> tag -> saved
+  to disk ONCE as an evenodd polygon with a unique id -> geometry resolves to grid cells ->
+  classifier trains on it (n_unparseable == 0) -> sticky re-arm -> re-select -> delete. Plus a
+  coordinate PROOF rather than an eyeball: the toolbar rect tool and a freehand lasso over the
+  same screen corners land on the same image rectangle (drift 0.0 px). Zero page errors
+  throughout. Edge cases checked: abandoning the editor discards the region and writes nothing;
+  a click-without-drag creates nothing and says "stroke too small"; Escape disarms.

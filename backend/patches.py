@@ -1,61 +1,55 @@
-"""Patch extraction from annotations + tissue masking (Phase 3).
+"""The tile grid, annotation geometry, and the tissue mask.
 
-Turns the user's labelled regions into the training material the ML pipeline
-needs: for each annotation we cut 224x224 tiles (the input size Virchow 2
-expects) from the slide with OpenSlide at the model's target magnification, drop
-background/white tiles with a simple tissue mask, and record each kept tile's
-coordinates + class label.
+Every part of the pipeline — feature extraction, training, and inference — tiles a
+slide the SAME way: one fixed, slide-wide grid of `size0`-pixel cells, addressed by
+integer `(col, row)`. This module is the only place that grid is defined.
 
-The output is a per-slide **manifest** (JSON) plus a **preview montage** (one
-stitched image) so the extraction can be eyeballed. The manifest is exactly what
-Phase 4 (embeddings) and Phase 5 (training) consume — no model is involved here.
+That matters more than it sounds. An earlier version tiled each annotation starting
+at *its own bounding-box corner* while inference tiled the viewport on a global grid.
+Same tile size, same magnification, but a different phase — so the classifier was
+trained on one set of tile alignments and applied to another. Keeping a single
+`grid_config()` is what makes that class of bug impossible.
 
-Deliberately dependency-light: only PIL + OpenSlide + stdlib. Tissue masking uses
-PIL's saturation channel; point-in-polygon is pure Python. numpy/scipy/shapely
-are intentionally avoided at this phase.
-
-Coordinate note: annotations are stored in the coordinate space of the DeepZoom
-base image. Because the DZI is built with limit_bounds=True (see slides.py), that
-space starts at the slide's bounds origin, so we offset annotation coords by
-(bounds-x, bounds-y) before calling OpenSlide's read_region (which works in
-full level-0 coordinates). For slides with a zero bounds origin (like the sample)
+Coordinate note: annotations and viewport regions are in the coordinate space of the
+DeepZoom base image. Because the DZI is built with limit_bounds=True (see slides.py),
+that space starts at the slide's bounds origin — so a cell's level-0 pixel origin adds
+(bounds-x, bounds-y) before OpenSlide's read_region sees it (read_region always works
+in full level-0 coordinates). For slides with a zero bounds origin (the CMU samples)
 the offset is (0, 0).
+
+Deliberately dependency-light: PIL + OpenSlide + stdlib. No numpy, no shapely.
 """
 
 from __future__ import annotations
 
-import json
+import math
 import os
 import re
-from math import ceil
-from pathlib import Path
 
 import openslide
 from PIL import Image
 
-from backend import annotations, slides
-
-# --- Extraction parameters ---------------------------------------------------
+# --- Tiling parameters -------------------------------------------------------
 PATCH_SIZE = 224          # pixels per side; the input size Virchow 2 expects
-TARGET_MPP = 0.5          # microns/pixel (~20x). Matches Virchow 2 and is stored
-                          # in the manifest so Phase 4 uses matching features.
+TARGET_MPP = 0.5          # microns/pixel (~20x). Matches Virchow 2's training data.
 
-# Tissue mask: a patch is kept if at least MIN_TISSUE_FRACTION of its pixels have
-# saturation >= SAT_THRESHOLD. White/grey background is near-zero saturation;
-# H&E-stained tissue is well above it. Both are easy to tune later.
-SAT_THRESHOLD = 25        # 0..255 saturation cutoff
+# --- Tissue mask -------------------------------------------------------------
+# A tile is tissue if at least MIN_TISSUE_FRACTION of its pixels have saturation at or
+# above a cutoff. White/grey background is near-zero saturation; H&E-stained tissue is
+# well above it. Two ways to pick that cutoff (SLIDEPROBE_TISSUE env var):
+#
+#   "otsu" (default) — derive it from the slide's own saturation histogram, so the mask
+#                      adapts to how faintly or darkly this slide happens to be stained.
+#   "hsv"            — a fixed cutoff of SAT_THRESHOLD. Predictable; stain-blind.
 MIN_TISSUE_FRACTION = 0.30
+SAT_THRESHOLD = 25        # 0..255; the fixed cutoff used by the "hsv" mask
 
-# Where manifests + montages are cached (gitignored).
-PATCHES_DIR = slides.REPO_ROOT / "data" / "cache" / "patches"
-
-# How many patches to show in the preview montage, and the thumbnail size.
-MONTAGE_MAX = 64
-MONTAGE_COLS = 8
-MONTAGE_THUMB = 96
+OVERVIEW_MAX = 2048       # longest side of the low-res slide overview Otsu reads
+OTSU_MIN_SAT = 8          # sanity band for a derived threshold (see _otsu_gate)
+OTSU_MAX_SAT = 80
 
 
-# --- Slide geometry helpers --------------------------------------------------
+# --- Slide geometry ----------------------------------------------------------
 
 def _slide_mpp(slide: openslide.OpenSlide) -> float:
     """Microns-per-pixel at level 0. Falls back to objective power, then 0.5."""
@@ -75,11 +69,75 @@ def _slide_mpp(slide: openslide.OpenSlide) -> float:
     return 0.5  # last-resort default; documented so results stay interpretable
 
 
+def slide_mpp(slide: openslide.OpenSlide) -> float:
+    """Public accessor for the slide's level-0 µm/px (recorded in feature banks)."""
+    return _slide_mpp(slide)
+
+
 def _bounds_offset(slide: openslide.OpenSlide) -> tuple[int, int]:
     """(bounds-x, bounds-y) in level-0 pixels; (0, 0) if the slide has no bounds."""
     bx = slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_X)
     by = slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_Y)
     return (int(bx) if bx else 0, int(by) if by else 0)
+
+
+def _bounded_size(slide: openslide.OpenSlide) -> tuple[int, int]:
+    """Size of the DZI base image: the bounded region, not the whole level-0 image."""
+    bw = slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_WIDTH)
+    bh = slide.properties.get(openslide.PROPERTY_NAME_BOUNDS_HEIGHT)
+    dim_x, dim_y = slide.dimensions
+    return (int(bw) if bw else dim_x, int(bh) if bh else dim_y)
+
+
+def grid_config(slide: openslide.OpenSlide) -> dict:
+    """THE slide-wide tile grid. Nothing else derives geometry on its own.
+
+    Returns {"size0", "level", "off_x", "off_y", "cols", "rows"}:
+      size0        side of a cell in LEVEL-0 pixels (so it is PATCH_SIZE px at TARGET_MPP)
+      level        the pyramid level to read from (best match for the downsample)
+      off_x/off_y  the bounds origin, added to get level-0 coords for read_region
+      cols/rows    the grid's extent
+
+    cols/rows use floor division, so a partial strip at the right/bottom edge (too
+    narrow to make a full tile) is simply outside the grid. Every downstream bounds
+    check is therefore just `0 <= col < cols and 0 <= row < rows`.
+
+    All values are ints: a grid dict is stored in each feature bank and compared for
+    equality on load, so a bank built under a different tiling is rejected outright.
+    """
+    mpp0 = _slide_mpp(slide)
+    # Side length (in level-0 pixels) of a tile that is PATCH_SIZE px at TARGET_MPP.
+    size0 = max(1, round(PATCH_SIZE * TARGET_MPP / mpp0))
+    level = int(slide.get_best_level_for_downsample(max(1.0, size0 / PATCH_SIZE)))
+    off_x, off_y = _bounds_offset(slide)
+    width, height = _bounded_size(slide)
+    return {
+        "size0": size0,
+        "level": level,
+        "off_x": off_x,
+        "off_y": off_y,
+        "cols": width // size0,
+        "rows": height // size0,
+    }
+
+
+def in_grid(grid: dict, col: int, row: int) -> bool:
+    return 0 <= col < grid["cols"] and 0 <= row < grid["rows"]
+
+
+def cell_origin(grid: dict, col: int, row: int) -> tuple[int, int]:
+    """Level-0 pixel origin of a cell, ready for read_region (bounds offset included)."""
+    return col * grid["size0"] + grid["off_x"], row * grid["size0"] + grid["off_y"]
+
+
+def cell_index(grid: dict, col: int, row: int) -> int:
+    """Flatten (col, row) to a single int — how cells are stored in a feature bank."""
+    return row * grid["cols"] + col
+
+
+def index_cell(grid: dict, idx: int) -> tuple[int, int]:
+    """Inverse of cell_index."""
+    return idx % grid["cols"], idx // grid["cols"]
 
 
 # --- Annotation parsing ------------------------------------------------------
@@ -92,6 +150,22 @@ def _label_of(anno: dict) -> str:
         if isinstance(b, dict) and b.get("purpose") == "tagging" and b.get("value"):
             return str(b["value"])
     return "unlabeled"
+
+
+def label_of(anno: dict) -> str:
+    """Public accessor for an annotation's class label."""
+    return _label_of(anno)
+
+
+def parse_annotation(anno: dict):
+    """Public accessor: (label, kind, geometry), or None if the selector isn't understood.
+
+    Exposed so callers can tell "I cannot READ this shape" apart from "this shape covers
+    no tissue". They look identical from cells_in_annotation() (both give []), and
+    conflating them produces a very confusing error: the app used to tell the user their
+    region contained no tissue when the truth was that the backend couldn't parse it.
+    """
+    return _parse_annotation(anno)
 
 
 def _parse_annotation(anno: dict):
@@ -155,14 +229,71 @@ def _point_in_polygon(x: float, y: float, pts) -> bool:
     return inside
 
 
-# --- Pixel reading + tissue mask ---------------------------------------------
+# --- Which cells does a shape / a viewport cover? ----------------------------
 
-def _read_patch(slide, x0: int, y0: int, size0: int, level: int) -> Image.Image:
-    """Read a size0-square region at level-0 coords (x0, y0) and return 224x224 RGB.
+def cells_in_region(grid: dict, region: dict) -> tuple[int, int, int, int]:
+    """Snap a DZI-pixel viewport {x,y,w,h} to the grid. -> (col0, row0, cols, rows).
 
-    Reads from the pyramid level best matching the requested downsample, then
-    resizes to PATCH_SIZE. read_region always takes level-0 coordinates.
+    Clipped to the grid, so the returned block contains only real, full cells.
     """
+    size0 = grid["size0"]
+    rx, ry = float(region.get("x", 0)), float(region.get("y", 0))
+    rw, rh = float(region.get("w", 0)), float(region.get("h", 0))
+    col0 = max(0, min(grid["cols"], math.floor(rx / size0)))
+    row0 = max(0, min(grid["rows"], math.floor(ry / size0)))
+    col1 = max(0, min(grid["cols"], math.ceil((rx + rw) / size0)))
+    row1 = max(0, min(grid["rows"], math.ceil((ry + rh) / size0)))
+    return col0, row0, max(0, col1 - col0), max(0, row1 - row0)
+
+
+def cells_in_annotation(grid: dict, annotation: dict) -> list[tuple[int, int]]:
+    """The grid cells an annotation covers. PURE GEOMETRY — reads no pixels.
+
+    A cell belongs to the annotation when its CENTRE falls inside the shape. This
+    is what lets training assemble its dataset without touching the slide: the
+    cells' embeddings are already in the feature bank.
+
+    Returns [] for an unparseable annotation. An annotation smaller than one cell
+    falls back to the single cell containing its centroid, so a tiny region still
+    contributes one training sample rather than silently none.
+    """
+    parsed = _parse_annotation(annotation)
+    if parsed is None:
+        return []
+    _label, kind, geom = parsed
+    size0 = grid["size0"]
+    x, y, w, h = _bbox(kind, geom)
+
+    cells: list[tuple[int, int]] = []
+    for row in range(math.floor(y / size0), math.ceil((y + h) / size0)):
+        for col in range(math.floor(x / size0), math.ceil((x + w) / size0)):
+            if not in_grid(grid, col, row):
+                continue
+            cx, cy = (col + 0.5) * size0, (row + 0.5) * size0
+            if kind == "polygon":
+                if not _point_in_polygon(cx, cy, geom):
+                    continue
+            elif not (x <= cx < x + w and y <= cy < y + h):
+                continue
+            cells.append((col, row))
+
+    if not cells:
+        col, row = math.floor((x + w / 2) / size0), math.floor((y + h / 2) / size0)
+        if in_grid(grid, col, row):
+            cells.append((col, row))
+    return cells
+
+
+# --- Pixel reading + the tissue mask -----------------------------------------
+
+def read_cell(slide, grid: dict, col: int, row: int) -> Image.Image:
+    """Read one grid cell as a PATCH_SIZE-square RGB image.
+
+    Reads from the pyramid level best matching the target downsample, then resizes
+    to PATCH_SIZE. read_region always takes level-0 coordinates.
+    """
+    x0, y0 = cell_origin(grid, col, row)
+    size0, level = grid["size0"], grid["level"]
     ds = slide.level_downsamples[level]
     read_size = max(1, round(size0 / ds))
     region = slide.read_region((int(x0), int(y0)), level, (read_size, read_size))
@@ -174,163 +305,134 @@ def _read_patch(slide, x0: int, y0: int, size0: int, level: int) -> Image.Image:
     return rgb
 
 
-def read_patch(slide, x: int, y: int, size: int, level: int) -> Image.Image:
-    """Public wrapper: read one manifest patch as a 224x224 RGB image.
+def _saturation_histogram(img: Image.Image) -> list[int]:
+    """256-bin histogram of the HSV saturation channel.
 
-    Phase 4 (embeddings) reuses this to fetch patch pixels from a manifest entry
-    ({x, y, size, level}) without duplicating the read/resize logic.
+    Saturation is the signal that separates stain from slide: H&E tissue is strongly
+    coloured, while background glass/scanner white is near-grey (saturation ~0).
     """
-    return _read_patch(slide, x, y, size, level)
+    return img.convert("HSV").split()[1].histogram()
 
 
-def _is_tissue(img: Image.Image) -> bool:
-    """True if enough of the patch is saturated (stained) rather than background."""
-    saturation = img.convert("HSV").split()[1]  # S channel, 0..255
-    hist = saturation.histogram()               # 256 bins
+def _overview(slide) -> Image.Image:
+    """A small RGB image of the whole BOUNDED slide, for slide-level statistics.
+
+    Read from the pyramid level closest to the target downsample, so this costs one
+    cheap low-res read rather than a scan of level 0. Note it reads the BOUNDED region
+    (not slide.get_thumbnail, which would include the scanner's dead margin and skew
+    any statistic computed from it).
+    """
+    off_x, off_y = _bounds_offset(slide)
+    width, height = _bounded_size(slide)
+    scale = max(1.0, max(width, height) / OVERVIEW_MAX)
+    level = int(slide.get_best_level_for_downsample(scale))
+    ds = slide.level_downsamples[level]
+    size = (max(1, int(width / ds)), max(1, int(height / ds)))
+
+    region = slide.read_region((off_x, off_y), level, size)
+    rgb = Image.new("RGB", region.size, (255, 255, 255))
+    rgb.paste(region, mask=region.split()[-1])
+    if max(rgb.size) > OVERVIEW_MAX:  # the level may still be larger than we need
+        rgb.thumbnail((OVERVIEW_MAX, OVERVIEW_MAX))
+    return rgb
+
+
+def _otsu(hist: list[int]) -> int:
+    """Otsu's threshold on a 256-bin histogram.
+
+    Returns the LOWEST bin belonging to the foreground (bright/saturated) class, i.e.
+    the value `t` such that the split {0..t-1} vs {t..255} maximizes between-class
+    variance. Pure Python over 256 bins — no numpy, no scikit-image needed.
+    """
     total = sum(hist)
     if total == 0:
-        return False
-    tissue_pixels = sum(hist[SAT_THRESHOLD:])
-    return (tissue_pixels / total) >= MIN_TISSUE_FRACTION
-
-
-# --- Grid + orchestration ----------------------------------------------------
-
-def _grid_origins(bbox, size0: int):
-    """Non-overlapping grid of patch top-left corners covering a bbox.
-
-    Always yields at least one cell, so regions smaller than a patch still
-    produce a single (bbox-anchored) patch.
-    """
-    x, y, w, h = bbox
-    origins = []
-    yy = y
-    while yy < y + h:
-        xx = x
-        while xx < x + w:
-            origins.append((xx, yy))
-            xx += size0
-        yy += size0
-    if not origins:
-        origins.append((x, y))
-    return origins
-
-
-def _save_montage(images, path: Path) -> bool:
-    """Stitch up to MONTAGE_MAX patch thumbnails into one JPEG for eyeballing."""
-    if not images:
-        return False
-    imgs = images[:MONTAGE_MAX]
-    cols = min(MONTAGE_COLS, len(imgs))
-    rows = ceil(len(imgs) / cols)
-    canvas = Image.new("RGB", (cols * MONTAGE_THUMB, rows * MONTAGE_THUMB), (30, 34, 40))
-    for i, im in enumerate(imgs):
-        r, c = divmod(i, cols)
-        canvas.paste(im.resize((MONTAGE_THUMB, MONTAGE_THUMB)), (c * MONTAGE_THUMB, r * MONTAGE_THUMB))
-    canvas.save(path, "JPEG", quality=80)
-    return True
-
-
-def manifest_path(slide_id: str) -> Path:
-    return PATCHES_DIR / f"{slide_id}.json"
-
-
-def preview_path(slide_id: str) -> Path:
-    return PATCHES_DIR / f"{slide_id}_preview.jpg"
-
-
-def load_manifest(slide_id: str) -> dict | None:
-    """Return a previously-extracted manifest, or None if not extracted yet."""
-    path = manifest_path(slide_id)
-    if not path.exists():
-        return None
-    with path.open("r", encoding="utf-8") as fh:
-        return json.load(fh)
-
-
-def extract_patches(slide_id: str) -> dict | None:
-    """Extract labelled tissue patches for a slide; write manifest + montage.
-
-    Returns the manifest dict, or None if the slide doesn't exist.
-    """
-    slide = slides.get_slide(slide_id)
-    if slide is None:
-        return None
-
-    annos = annotations.load(slide_id)
-    mpp0 = _slide_mpp(slide)
-    # Side length (in level-0 pixels) of a patch that is PATCH_SIZE px at TARGET_MPP.
-    size0 = max(1, round(PATCH_SIZE * TARGET_MPP / mpp0))
-    level = slide.get_best_level_for_downsample(max(1.0, size0 / PATCH_SIZE))
-    off_x, off_y = _bounds_offset(slide)
-    dim_x, dim_y = slide.dimensions
-
-    patches: list[dict] = []
-    per_class: dict[str, int] = {}
-    montage_imgs: list[Image.Image] = []
-    candidates = dropped_background = skipped = 0
-
-    for anno_index, anno in enumerate(annos):
-        parsed = _parse_annotation(anno)
-        if parsed is None:
-            skipped += 1
+        return 0
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    sum_bg = 0.0
+    w_bg = 0
+    best_var, best_t = -1.0, 0
+    for t in range(256):
+        w_bg += hist[t]
+        if w_bg == 0:
             continue
-        label, kind, geom = parsed
-        bbox = _bbox(kind, geom)
-        # Identity of the drawn region this patch came from. Phase 5 splits
-        # train/val by this so spatially-adjacent tiles from one region never
-        # straddle the split (leakage). Prefer the annotation's own id.
-        group = f"{slide_id}::{anno.get('id') or f'anno{anno_index}'}"
+        w_fg = total - w_bg
+        if w_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / w_bg
+        mean_fg = (sum_all - sum_bg) / w_fg
+        between = w_bg * w_fg * (mean_bg - mean_fg) ** 2
+        if between > best_var:
+            best_var, best_t = between, t
+    return best_t + 1  # first foreground bin
 
-        for (gx, gy) in _grid_origins(bbox, size0):
-            # For polygons, keep only cells whose centre falls inside the shape.
-            if kind == "polygon":
-                if not _point_in_polygon(gx + size0 / 2, gy + size0 / 2, geom):
-                    continue
-            candidates += 1
 
-            # Convert to level-0 pixel coords and skip anything off the slide.
-            x0 = int(round(gx)) + off_x
-            y0 = int(round(gy)) + off_y
-            if x0 < off_x or y0 < off_y or x0 + size0 > off_x + dim_x or y0 + size0 > off_y + dim_y:
-                continue
+class TissueGate:
+    """The tissue test for ONE slide: `gate(tile) -> bool`, plus an `id` for the bank.
 
-            patch = _read_patch(slide, x0, y0, size0, level)
-            if not _is_tissue(patch):
-                dropped_background += 1
-                continue
+    A tile counts as tissue when at least `min_fraction` of its pixels have saturation
+    >= `threshold`. Where that threshold comes from is what distinguishes the masks.
 
-            patches.append({"x": x0, "y": y0, "size": size0, "level": level, "label": label, "group": group})
-            per_class[label] = per_class.get(label, 0) + 1
-            if len(montage_imgs) < MONTAGE_MAX:
-                montage_imgs.append(patch)
+    `id` is recorded in every feature bank and checked on load, so changing the mask (or
+    its parameters) correctly invalidates existing banks rather than silently mixing
+    tiles judged by two different rules.
+    """
 
-    PATCHES_DIR.mkdir(parents=True, exist_ok=True)
-    _save_montage(montage_imgs, preview_path(slide_id))
+    def __init__(self, name: str, threshold: int, min_fraction: float):
+        self.name = name
+        self.threshold = int(threshold)
+        self.min_fraction = float(min_fraction)
+        self.id = f"{name}-sat{self.threshold}-frac{self.min_fraction}"
 
-    manifest = {
-        "slide_id": slide_id,
-        "config": {
-            "patch_size": PATCH_SIZE,
-            "target_mpp": TARGET_MPP,
-            "slide_mpp": mpp0,
-            "level": level,
-        },
-        "counts": {
-            "candidates": candidates,
-            "kept": len(patches),
-            "dropped_background": dropped_background,
-            "skipped_unparseable": skipped,
-        },
-        "per_class": per_class,
-        "patches": patches,
-    }
+    def __call__(self, img: Image.Image) -> bool:
+        hist = _saturation_histogram(img)
+        total = sum(hist)
+        if total == 0:
+            return False
+        return sum(hist[self.threshold:]) / total >= self.min_fraction
 
-    # Atomic write (temp file + os.replace), mirroring annotations.save.
-    path = manifest_path(slide_id)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2)
-    os.replace(tmp, path)
 
-    return manifest
+def _hsv_gate(slide) -> TissueGate:
+    """Fixed saturation cutoff. Simple and predictable; ignores the slide entirely."""
+    return TissueGate("hsv", SAT_THRESHOLD, MIN_TISSUE_FRACTION)
+
+
+def _otsu_gate(slide) -> TissueGate:
+    """Otsu's method — the cutoff is LEARNED from this slide's own saturation histogram.
+
+    Why it reads a whole-slide overview rather than thresholding each tile:
+    Otsu always finds a split. Run it on a tile of blank glass and it will happily
+    divide the sensor noise into "dark" and "light" and hand back a threshold that
+    calls half the background tissue. The histogram it sees must actually contain both
+    populations — so the threshold is derived ONCE, from an overview of the whole
+    slide, and then applied per tile.
+
+    This is the point of Otsu here: it adapts to the stain. A faintly-stained slide gets
+    a lower cutoff and a darkly-stained one a higher cutoff, where the fixed hsv=25
+    would under- or over-call tissue on both.
+
+    The clamp guards the degenerate case where the overview has only ONE population
+    (a slide that is nearly all tissue, or nearly all background): Otsu would then be
+    splitting noise, so we refuse to trust a threshold outside a sane band.
+    """
+    threshold = _otsu(_saturation_histogram(_overview(slide)))
+    threshold = max(OTSU_MIN_SAT, min(OTSU_MAX_SAT, threshold))
+    return TissueGate("otsu", threshold, MIN_TISSUE_FRACTION)
+
+
+_TISSUE_GATES = {"hsv": _hsv_gate, "otsu": _otsu_gate}
+
+
+def tissue_mask_name() -> str:
+    """Which tissue mask is selected: "otsu" (default) or "hsv"."""
+    name = os.environ.get("SLIDEPROBE_TISSUE", "otsu").lower()
+    return name if name in _TISSUE_GATES else "otsu"
+
+
+def tissue_gate(slide) -> TissueGate:
+    """Build the tissue test for a slide. Called ONCE per slide (features.py caches it).
+
+    Otsu reads a low-res overview to derive its threshold, so this is not free — do not
+    call it per tile.
+    """
+    return _TISSUE_GATES[tissue_mask_name()](slide)

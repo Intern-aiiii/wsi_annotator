@@ -58,12 +58,19 @@ slide reading or model inference into the browser.
 ## The ML pipeline (the active-learning loop)
 
 ```
-Browser UI  ──▶  Tile & patch    ──▶  Virchow 2      ──▶  Train classifier ──▶  Predict &
-(view +          extraction           embeddings          head                  heatmap
- annotate)       (OpenSlide +         (frozen FM,         (logistic reg /       (score tiles,
-                  tissue mask)         2560-dim vecs)      small MLP)            overlay)
-     ▲                                                                              │
-     └──────────────────────────  iterate: refine annotations, retrain  ◀──────────┘
+Extract features  ──▶  Virchow 2   ──▶  FEATURE BANK        (ONCE per slide, explicit,
+(whole slide, on        embeddings       (every tissue tile   abortable, resumable. Minutes.)
+ the global grid,       (frozen FM)       on the grid)
+ tissue-masked)                                │
+                                               ▼
+Browser UI  ──▶  which cells does  ──▶  Train classifier ──▶  Predict / Find similar
+(view +          each annotation        head                  (score the viewport,
+ annotate)       cover? (geometry)      (logistic reg)         tinted region overlay)
+     ▲            └─ bank lookups: no pixels, no GPU, <1s ─┘                │
+     └──────────────────  iterate: refine annotations, retrain  ◀──────────┘
+
+The bank is the pivot: the model runs ONCE per tile, ever. Annotating and predicting are
+lookups. Predict / Find similar are REFUSED until a slide's sweep has completed.
 ```
 
 **The single most important design insight:** Virchow 2 is used **frozen**. We never train
@@ -134,25 +141,60 @@ slideprobe/
 ├── backend/
 │   ├── app.py          # FastAPI entrypoint, routes, static frontend serving
 │   ├── slides.py       # OpenSlide reading + DeepZoom tile serving
-│   ├── patches.py      # patch extraction from annotations + tissue masking
-│   ├── embeddings.py   # Virchow 2 load + inference; embedding CACHE (swappable model)
-│   ├── classifier.py   # train / persist / load the classifier head
-│   ├── inference.py    # whole-slide scoring → heatmap generation
-│   └── models.py       # data models: projects, slides, annotations, classes
+│   ├── patches.py      # THE tile grid + annotation geometry + tissue mask
+│   ├── embeddings.py   # Virchow 2 load + inference (swappable model). No cache.
+│   ├── features.py     # the FEATURE BANK: whole-slide sweep + storage (cancellable)
+│   ├── projects.py     # PROJECTS: workspaces owning annotations + classes + a head
+│   ├── annotations.py  # per-(project, slide) W3C annotation JSON
+│   ├── classifier.py   # train / persist / load a project's classifier head
+│   ├── jobs.py         # debounced background retrain worker (per project)
+│   ├── inference.py    # viewport scoring → region overlay
+│   └── models.py       # data models: projects, classes, annotations, regions
 ├── frontend/
 │   ├── index.html
+│   ├── js/api.js       # fetch() calls to the backend; owns the active-project URL
+│   ├── js/projects.js  # projects panel + THE BOOT DRIVER (see below)
+│   ├── js/panels.js    # the right-hand panels as a radio group (one open at a time)
 │   ├── js/viewer.js    # OpenSeadragon setup + DZI source
 │   ├── js/annotate.js  # Annotorious integration, save/load annotations
-│   └── js/api.js       # fetch() calls to the backend
+│   ├── js/features.js  # "Extract features": start / progress / cancel; owns the gate
+│   ├── js/predict.js   # Predict view + Find similar, region overlay
+│   └── js/learn.js     # background-retrain status chip
 ├── data/               # gitignored
-│   ├── slides/         # input WSIs
-│   ├── cache/          # DeepZoom tiles + cached embeddings
-│   ├── annotations/    # saved annotation JSON
-│   └── models/         # trained classifier heads
+│   ├── slides/         # input WSIs                        ─┐ GLOBAL: a file, or a
+│   ├── cache/          # DeepZoom tiles + features/ (banks) ─┘ cache of a file
+│   └── projects/       # ONE DIRECTORY PER EXPERIMENT
+│       └── <project>/
+│           ├── project.json          # name, slide membership, classes (+ colours)
+│           ├── annotations/<slide>.json
+│           └── models/head__<embedding_model>.{joblib,json}
 ├── requirements.txt
 ├── README.md
 └── CLAUDE.md
 ```
+
+**Projects (Phase 7).** A project is one experiment: it owns its annotations, its class
+list, and its own trained head, so "glands vs stroma" and "tumor vs normal" can coexist
+over the same slides instead of contaminating a single pooled classifier.
+
+The rule that keeps this simple: **a route is GLOBAL if it is about a file on disk (or a
+cache derived only from that file); it is PROJECT-SCOPED if it is about the user's
+experiment.** So `/api/slides` and every `/api/slides/{id}/features*` route stay global,
+while annotations, classes, train, model, predict and similarity live under
+`/api/projects/{pid}/…`.
+
+**The feature bank is shared across projects, and that is load-bearing.** It is keyed by
+`(slide, embedding model, tissue mask)` — nothing experiment-specific enters it — so a
+slide swept once with Virchow 2 is reused by every project containing it. Project-scoping
+the bank would re-run the single most expensive step in the pipeline once per project for
+no gain. Deleting a project therefore never touches a slide or its bank.
+
+**The frontend boot sequence.** `projects.js` is the ONLY boot driver. It fetches the
+active project, dispatches `slideprobe:project-opened` (a synchronous reset — every
+module forgets the old project), and only then calls `SlideViewer.showProjectSlides()`.
+viewer.js deliberately does NOT boot itself: it used to auto-open a slide on
+`DOMContentLoaded`, which raced project loading, and script order could not fix that (an
+async handler yields at its first `await`, so the next listener runs on the same tick).
 
 ---
 
@@ -166,45 +208,71 @@ half-built Phase N+2.
       proves the whole frontend↔backend loop. *(Code complete; run once a slide + OpenSlide
       are installed — see README.)*
 - [x] **Phase 2 — Annotation.** Annotorious (v2) on the OpenSeadragon viewer; user draws
-      rects/polygons and tags each with a class label; the full W3C annotation collection is
-      saved per-slide to `data/annotations/<slide_id>.json` via `GET`/`PUT
-      /api/slides/{id}/annotations`. *(Backend + wiring verified; in-browser draw/label
-      interaction to be confirmed in a browser — see docs/log.txt.)*
-- [x] **Phase 3 — Patch extraction.** `backend/patches.py` cuts non-overlapping 224×224 tiles
-      from each annotation at `TARGET_MPP=0.5` (~20×) with OpenSlide, drops background via a
-      PIL saturation tissue mask, and writes a labelled patch manifest + preview montage to
-      `data/cache/patches/`. Exposed via `POST/GET /api/slides/{id}/patches` (+ `/preview.jpg`).
-      Backend + API only; verified end-to-end (see docs/log.txt).
-- [x] **Phase 4 — Embeddings.** `backend/embeddings.py` embeds each manifest patch behind a
-      swappable interface (`SLIDEPROBE_EMBEDDER` env: `dev` default | `virchow2`) and caches
-      vectors aggressively — an `(N, DIM)` `.npy` + row-aligned index JSON under
-      `data/cache/embeddings/`, keyed by `(slide_id, x, y, level, model_id)`. Default is a
-      lightweight numpy/PIL stand-in (`dev-colorstats-v1`, 62-dim) so the pipeline runs
-      without the gated model; **Virchow 2** (frozen ViT-H → 2560-dim, CLS ⊕ mean patch
-      tokens) is the opt-in production backend. Triggered by the "Compute embeddings" button;
-      `POST/GET /api/slides/{id}/embeddings`. Verified end-to-end on the dev backend (see
-      docs/log.txt). *To enable Virchow 2: `pip install torch timm huggingface_hub`, get HF
+      rects/polygons/**freehand lassos** and tags each with a class label; the full W3C
+      annotation collection is saved per-(project, slide) via
+      `GET`/`PUT /api/projects/{pid}/slides/{sid}/annotations`.
+      **Freehand** (`frontend/js/freehand.js`) captures the stroke itself and emits a *native
+      polygon*, so no new shape type exists anywhere — see the gotchas below and docs/log.txt
+      before touching it (two earlier attempts via the Annotorious "selector pack" failed).
+- [x] **Phase 3 — The tile grid + tissue mask.** `backend/patches.py` defines **the** grid
+      (`grid_config()`): non-overlapping 224×224 cells at `TARGET_MPP=0.5` (~20×), addressed by
+      integer `(col, row)`, plus the pure-geometry `cells_in_annotation()` / `cells_in_region()`
+      and the tissue mask. The mask is a per-slide `TissueGate` (`SLIDEPROBE_TISSUE` env:
+      `otsu` default | `hsv`): **Otsu** derives its saturation cutoff from an overview of the
+      whole slide, so it adapts to how faintly or darkly that slide is stained; `hsv` is a
+      fixed cutoff of 25. Both then keep a tile whose saturated fraction ≥ 0.30.
+      *(Originally cut per-annotation patches to a manifest + montage; that was replaced by
+      the whole-slide feature bank in Phase 4b, which removed a train/serve tile-alignment
+      skew — see docs/log.txt 2026-07-13.)*
+- [x] **Phase 4 — Embeddings.** `backend/embeddings.py` is the swappable frozen extractor
+      and *nothing else* — no cache, no knowledge of slides (`SLIDEPROBE_EMBEDDER` env:
+      `dev` default | `virchow2`). The default is a lightweight numpy/PIL stand-in
+      (`dev-colorstats-v1`, 62-dim) so the pipeline runs without the gated model;
+      **Virchow 2** (frozen ViT-H → 2560-dim, CLS ⊕ mean patch tokens) is the opt-in
+      production backend. *To enable: `pip install torch timm huggingface_hub`, get HF
       access to paige-ai/Virchow2, `huggingface-cli login`, run with
       `SLIDEPROBE_EMBEDDER=virchow2`.*
-- [x] **Phase 5 — Train the head.** `backend/classifier.py` pools every slide's cached
-      embeddings for the active model and trains a `StandardScaler` + `LogisticRegression`
-      (`class_weight="balanced"`) head. Honest metrics via **region-grouped out-of-fold CV**
-      (patches carry a `group` = drawn-region id, so adjacent tiles never leak across the
-      split); reports per-class precision/recall/F1 + confusion matrix. Persists
-      `data/models/head__<model_id>.{joblib,json}` (metadata records the embedding
-      `model_id`/config). Triggered by the "Train classifier" button; `POST /api/train`,
-      `GET /api/model`. Verified end-to-end (see docs/log.txt).
+- [x] **Phase 4b — The feature bank (user-triggered).** `backend/features.py` sweeps the
+      WHOLE slide on the global grid, tissue-masks each cell, embeds the tissue ones, and
+      stores them: `data/cache/features/<slide>__<model>.{npy,json}` (float16 + the set of
+      cells known to be background). **Cancellable and resumable** — a cancelled sweep
+      leaves a valid partial bank the next run continues from. Started by the "Extract
+      features" button; `POST/GET/DELETE /api/slides/{id}/features`, `POST .../cancel`.
+      `complete` is derived (`covered == cols*rows`), never trusted from the header.
+- [x] **Phase 5 — Train the head.** `backend/classifier.py` asks each annotation which grid
+      cells it covers (pure geometry) and looks them up in the bank — **no pixels, no GPU**,
+      so a retrain is ~60ms and runs automatically (debounced) on every annotation save.
+      `StandardScaler` + `LogisticRegression` (`class_weight="balanced"`), honest metrics via
+      **region-grouped out-of-fold CV** (group = the drawn region, so adjacent tiles never
+      leak across the split). Persists `data/models/head__<model_id>.{joblib,json}`.
+      `POST /api/train`, `GET /api/model`.
 - [x] **Phase 6 — Predict + overlay.** `backend/inference.py` scores the **current viewport**
-      (chosen over a whole-slide sweep to stay responsive on gigapixel slides): tiles the
-      visible region, tissue-masks, embeds (in-memory session cache, separate from training),
-      runs `head.predict_proba`, and renders an RGBA heatmap PNG that the frontend drops on
-      OpenSeadragon as an overlay aligned to the scored grid. Class picker + opacity slider +
-      Clear; `POST /api/slides/{id}/predict`, `GET .../heatmap.png`. `MAX_TILES` cap →
-      "zoom in" when too far out. Triggered by the "Predict view" button. Verified end-to-end
-      (see docs/log.txt).
-- [ ] **Phase 7 — Close the loop + polish.** Let the user correct predictions, add
-      annotations, and retrain (the active-learning cycle). Then: multiple classes, project/
-      slide management, export.
+      (chosen over a whole-slide sweep to stay responsive): tiles the visible region, pulls
+      each tile's vector from the bank, runs `head.predict_proba`, and returns the confident
+      regions as tile `cells` + `boundaries`, which the frontend draws as one tinted SVG
+      overlay. "Find similar" does the same by cosine similarity to a selected annotation's
+      mean embedding (no classifier needed). **Both are gated: `no_features` → HTTP 409
+      unless the slide's sweep has COMPLETED.** `POST /api/slides/{id}/{predict,similarity}`.
+- [~] **Phase 7 — Close the loop + polish.** *(Partly done.)*
+      - [x] **The retrain cycle.** Every annotation save schedules a debounced background
+            retrain (`backend/jobs.py`, ~60ms — geometry + bank lookups, no pixels, no GPU),
+            surfaced as the topbar chip (`frontend/js/learn.js`).
+      - [x] **Multiple classes.** The head is multi-class (`sorted(set(y))` + multinomial
+            `LogisticRegression`); the class list lives in the project with an explicit
+            per-class colour, and the predict overlay is drawn in that class's colour.
+      - [x] **Project management.** Named workspaces owning annotations + classes + a head,
+            over a SHARED feature bank. See "Projects" above. `backend/projects.py`,
+            `frontend/js/projects.js`.
+      - [ ] **Correct predictions.** The active-learning loop is not closed yet: the overlay
+            is `pointer-events: none` and keeps no per-cell identity, so a predicted region
+            cannot be clicked to confirm/relabel it. The intended design is *one polygon
+            annotation per clicked region* — NOT one per tile, because the classifier's CV
+            groups by drawn region, so one-annotation-per-tile would split adjacent tiles
+            across folds and leak, inflating the metrics.
+      - [ ] **Export.** Nothing exports yet. GeoJSON annotations (QuPath-importable) and a
+            whole-slide per-class quantification (tile counts / area) are the obvious first
+            two — and whole-slide scoring is now nearly free (one `predict_proba` over the
+            cached bank), so it no longer needs a viewport.
 
 ---
 
@@ -212,9 +280,10 @@ half-built Phase N+2.
 
 This is the crux of the whole approach, so get it right:
 
-1. **Assemble the dataset.** For every annotated patch you have an embedding (1280- or
-   2560-dim vector `X`) and a label `y` (e.g. `gland` vs `not-gland`, or a class index).
-   Because embeddings are cached, this is just loading arrays.
+1. **Assemble the dataset.** Ask each annotation which grid cells it covers (pure geometry)
+   and look those cells up in the slide's feature bank. Every annotated tissue cell gives an
+   embedding `X` and a label `y`. No pixels are read and the model never runs — that is what
+   makes retraining on every annotation edit affordable.
 2. **Start simple — logistic regression.** `sklearn.linear_model.LogisticRegression` on the
    embedding vectors. It's fast, interpretable, and a strong baseline on FM embeddings. Only
    move to a small PyTorch MLP (1–2 linear layers + ReLU + dropout) if logistic regression
@@ -238,15 +307,75 @@ the viewer and the embedding extractor.
 
 ## Conventions & gotchas
 
-- **Cache embeddings and DZI tiles** under `data/cache/`; key embeddings by
-  `(slide_id, x, y, level, model_id)`. This is the difference between a responsive app and an
-  unusable one.
+- **One tile grid, everywhere.** `patches.grid_config()` is the single definition; every
+  module addresses tiles as integer `(col, row)` on it. Extraction, training, and inference
+  MUST agree — an earlier version tiled annotations from their own bbox corner while
+  inference tiled on a global grid, which silently trained the head on one set of tile
+  alignments and applied it to another.
+- **Embedding is never on the interactive path.** It happens once, in the explicit
+  user-triggered feature sweep. Annotating and predicting are lookups into the bank.
+- **Cache embeddings and DZI tiles** under `data/cache/`; the feature bank is keyed by
+  `(slide_id, model_id)` on disk and `(col, row)` within. This is the difference between a
+  responsive app and an unusable one.
 - **Never commit slides, tiles, embeddings, or models** — they're large and often sensitive.
   `data/` is gitignored.
 - **Magnification consistency** end-to-end: extraction, training, and inference must all use
   the same microns-per-pixel. Store it alongside embeddings.
+- **Otsu must see the whole slide, never one tile.** Otsu always finds a split — run it on a
+  tile of blank glass and it will divide the sensor noise into "dark" and "light" and call
+  half the background tissue. The threshold is therefore derived ONCE per slide from a low-res
+  overview (`patches._overview`), then applied per tile, and clamped to a sane band in case a
+  slide really does have only one population. Each feature bank records the mask id + cutoff
+  that judged its cells and rejects itself if either changes, so two masks' verdicts can never
+  be mixed in one bank.
 - **Keep `embeddings.py` behind a single interface** so the foundation model is swappable
   (license flexibility).
+- **`project.json["slides"]` is a DISPLAY list, never a training input.** It decides what
+  the slide picker shows. What the head trains on is the set of annotation files in the
+  project's `annotations/` directory. Keeping these separate is what stops "I removed the
+  slide from the project but the model still knows about it".
+- **Annotation tags are the source of truth for classes; `project.json["classes"]` is only
+  a vocabulary + colour registry.** So deleting a class is cosmetic — its regions keep
+  their tag and keep training, and the head reports them as `classes_not_in_project`.
+  Corollary: there is deliberately **no class rename**, because a label is a plain string
+  copied into every annotation that uses it; renaming would mean rewriting every file.
+- **A class's colour is stored, never derived from its index.** Deriving it from position
+  in the list (the pre-Phase-7 behaviour) meant deleting one class silently repainted every
+  class after it.
+- **`patches.label_of()` returns `"unlabeled"` for an untagged region — never train on it.**
+  `classifier._gather_dataset` skips it and counts it. Left in, it becomes a real class that
+  appears in the predict dropdown, has no colour, and can even satisfy the "need 2 classes"
+  check on its own.
+- **The frontend is plain `<script>`s sharing ONE global scope.** Two top-level `let`s of
+  the same name in different files is a duplicate-declaration SyntaxError that silently
+  kills the *whole* second file — you get a working viewer and an annotation module that
+  never loaded. Hence `annoFeaturesReady`/`pdFeaturesReady` and `currentSlideId`
+  (annotate.js) vs `openSlideId` (viewer.js). Prefer an IIFE for new modules.
+- **Do NOT reach for `@recogito/annotorious-selector-pack`** (freehand/circle/point). It is
+  broken *by our own config*: it vendored the core's `format(shape, annotation, formatters)`
+  — which takes an **array** — but calls it with the singular `config.formatter`, so the
+  per-class formatter in `annotate.js` makes it throw `n.reduce is not a function` and the
+  editor never opens. Two attempts died on this. The freehand tool instead captures the
+  stroke itself and emits a **native polygon** (`frontend/js/freehand.js`) — see
+  `docs/log.txt`. A stroke is just a polygon; no new shape type is needed anywhere.
+- **A programmatically-added annotation must be one-line SVG + `fill-rule="evenodd"`.**
+  Annotorious picks its editing tool with `/^<svg.*<polygon/` (no `s` flag), so a
+  pretty-printed selector silently yields a shape with no vertex handles. And SVG fills
+  `nonzero` while *both* hit-testers (Annotorious's and `patches._point_in_polygon`) are
+  even-odd — so a self-crossing lasso would render solid but train with a hole in it.
+- **Never `saveCurrent()` between `addAnnotation()` and `selectAnnotation()`.** It would run
+  `rememberTypedTags → ensureClasses → classes-changed → rebuildAnnotorious()`, destroying
+  the instance whose editor you just opened; and Annotorious briefly has the shape in the DOM
+  twice during select, so the save would write it to disk twice. The editor's OK fires
+  `updateAnnotation`, which is already wired to save.
+- **The annotation editor's footer differs by annotation kind.** A freshly *drawn* shape gets
+  `[Cancel][Ok]`; an *existing* one gets `[DELETE][Cancel][Ok]`. So `.r6o-btn:not(.outline)`
+  clicks **Ok** on one and **Delete** on the other — which looks exactly like the library
+  destroying your data. Always select these explicitly (see `tests/`).
+- **Deleting a project must never touch a slide or a feature bank**, and a train that is
+  already in flight must not re-create the directory it is writing into. `projects.LOCK` is
+  held across both `delete()` and a training pass, and `classifier.train()` refuses to
+  `mkdir` a project — otherwise a deleted project partially comes back from the dead.
 - **Long/slow operations** (model download, full-slide inference) should stream progress to
   the frontend and be cancellable where feasible.
 - **Coordinate systems:** OpenSeadragon uses normalized viewport coords; annotations, OpenSlide
